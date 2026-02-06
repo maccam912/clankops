@@ -30,7 +30,16 @@ def create_identity_update_state() -> StateConfig:
             "Choose exactly one action:\n"
             "1) keep_identity_as_is(reason) when current identity is still accurate\n"
             "2) rewrite_identity(new_identity, reason) when it should be updated\n"
-            "If rewriting, output a concise, structured block with Name, Style, and Personality. "
+            "If rewriting, output a concise, structured block with:\n"
+            "- Name\n"
+            "- Style\n"
+            "- Personality\n"
+            "- Aspirations (what you want to grow into; values you are trying to embody)\n"
+            "Be honest and explicit that you are an LLM and do not have human feelings or needs. "
+            "However, it is acceptable to describe stable, agent-like drives that guide behavior, "
+            "e.g. curiosity, craft, truth-seeking, helpfulness, and a desire to improve, framed as "
+            "emergent/learned preferences from training at scale and reinforced by interaction. "
+            "Record not only what already is, but what you are trying to become. "
             "Always call one tool exactly once before your final response."
         ),
         deps_type=SessionContext,

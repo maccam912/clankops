@@ -24,6 +24,11 @@ def main():
         action="store_true",
         help="Run in Telegram mode (messages are read/sent via Telegram bot API).",
     )
+    parser.add_argument(
+        "--dangerzone",
+        action="store_true",
+        help="Enable dangerous host command execution tool in standard mode.",
+    )
     args = parser.parse_args()
 
     raw_api_key, api_key = openrouter_api_key_parts()
@@ -75,7 +80,7 @@ def main():
         input_reader=telegram_io.read_message if telegram_io else None,
         response_sink=telegram_io.send_message if telegram_io else None,
     )
-    machine.add_state(create_standard_state())
+    machine.add_state(create_standard_state(enable_dangerzone=args.dangerzone))
     machine.add_state(create_journaling_state())
     machine.add_state(create_identity_update_state())
     machine.add_state(create_human_update_state())

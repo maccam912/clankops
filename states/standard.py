@@ -4,6 +4,7 @@ import os
 import random
 import re
 import sqlite3
+import subprocess
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -185,7 +186,7 @@ def _search_searxng(query: str, max_results: int) -> dict[str, object]:
     }
 
 
-def create_standard_state() -> StateConfig:
+def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
     base_url = "https://openrouter.ai/api/v1"
     model_name = os.environ.get("MODEL_NAME", "google/gemini-2.0-flash-exp:free").strip()
     api_key = get_openrouter_api_key()
@@ -401,6 +402,78 @@ def create_standard_state() -> StateConfig:
                 """
             ).fetchall()
         return _json([dict(row) for row in rows])
+
+    if enable_dangerzone:
+
+        @agent.tool
+        def run_bash_command(
+            ctx: RunContext[SessionContext],
+            command: str,
+            timeout_seconds: int = 30,
+            max_output_chars: int = MAX_TOOL_CHARS,
+        ) -> str:
+            """Run a bash command on the host machine."""
+            raw_command = command.strip()
+            if not raw_command:
+                return "Command is empty."
+
+            safe_timeout = max(1, min(timeout_seconds, 300))
+            safe_max_output = max(200, min(max_output_chars, 100000))
+
+            def _clip(text: str) -> tuple[str, bool]:
+                clipped = text[:safe_max_output]
+                return clipped, len(text) > safe_max_output
+
+            try:
+                completed = subprocess.run(
+                    ["bash", "-lc", raw_command],
+                    cwd=str(WORKSPACE_ROOT),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=safe_timeout,
+                    check=False,
+                )
+            except FileNotFoundError:
+                return _json(
+                    {
+                        "command": raw_command,
+                        "error": "bash executable not found on host.",
+                    }
+                )
+            except subprocess.TimeoutExpired as err:
+                stdout_text = err.stdout if isinstance(err.stdout, str) else ""
+                stderr_text = err.stderr if isinstance(err.stderr, str) else ""
+                stdout_clipped, stdout_truncated = _clip(stdout_text)
+                stderr_clipped, stderr_truncated = _clip(stderr_text)
+                return _json(
+                    {
+                        "command": raw_command,
+                        "cwd": str(WORKSPACE_ROOT),
+                        "timed_out": True,
+                        "timeout_seconds": safe_timeout,
+                        "stdout": stdout_clipped,
+                        "stderr": stderr_clipped,
+                        "stdout_truncated": stdout_truncated,
+                        "stderr_truncated": stderr_truncated,
+                    }
+                )
+
+            stdout_clipped, stdout_truncated = _clip(completed.stdout)
+            stderr_clipped, stderr_truncated = _clip(completed.stderr)
+            return _json(
+                {
+                    "command": raw_command,
+                    "cwd": str(WORKSPACE_ROOT),
+                    "timed_out": False,
+                    "exit_code": completed.returncode,
+                    "stdout": stdout_clipped,
+                    "stderr": stderr_clipped,
+                    "stdout_truncated": stdout_truncated,
+                    "stderr_truncated": stderr_truncated,
+                }
+            )
 
     @agent.tool
     def switch_to_journaling(ctx: RunContext[SessionContext]) -> str:
