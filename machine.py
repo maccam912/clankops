@@ -67,21 +67,30 @@ class SessionContext:
         if not text:
             return
         self.identity_block = text
-        self.memory_store.save_identity(text)
+        try:
+            self.memory_store.save_identity(text)
+        except Exception as err:
+            self.log_event("warning", f"Failed to save identity block: {err}")
 
     def set_human_block(self, value: str):
         text = value.strip()
         if not text:
             return
         self.human_block = text
-        self.memory_store.save_human(text)
+        try:
+            self.memory_store.save_human(text)
+        except Exception as err:
+            self.log_event("warning", f"Failed to save human block: {err}")
 
     def add_journal_entry(self, value: str):
         text = value.strip()
         if not text:
             return
         self.journal_entries.append(text)
-        self.memory_store.append_journal_entry(text)
+        try:
+            self.memory_store.append_journal_entry(text)
+        except Exception as err:
+            self.log_event("warning", f"Failed to append journal entry: {err}")
 
     def memory_blocks_prompt(self) -> str:
         return (

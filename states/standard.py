@@ -8,6 +8,7 @@ import subprocess
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
@@ -17,6 +18,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from debug_auth import get_openrouter_api_key
 from machine import SessionContext, StateConfig
+from tool_utils import safe_tool
 
 IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT", "30"))
 WORKSPACE_ROOT = Path.cwd().resolve()
@@ -109,15 +111,49 @@ def _fetch_url(
     url: str, max_chars: int, strip_html_content: bool = True
 ) -> dict[str, str | int | bool]:
     request = Request(url, headers={"User-Agent": WEB_USER_AGENT})
-    with urlopen(request, timeout=WEB_TIMEOUT_SECONDS) as response:
-        status = getattr(response, "status", 200)
-        content_type = response.headers.get("Content-Type", "")
-        charset = response.headers.get_content_charset() or "utf-8"
-        data = response.read(MAX_TOOL_CHARS * 4 + 1)
+    try:
+        with urlopen(request, timeout=WEB_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", 200)
+            content_type = response.headers.get("Content-Type", "")
+            charset = response.headers.get_content_charset() or "utf-8"
+            data = response.read(MAX_TOOL_CHARS * 4 + 1)
+            truncated = len(data) > MAX_TOOL_CHARS * 4
+            if truncated:
+                data = data[: MAX_TOOL_CHARS * 4]
+            text = data.decode(charset, errors="replace")
+            error: str | None = None
+    except HTTPError as err:
+        # HTTPError is also a response-like object (may include a body).
+        status = int(getattr(err, "code", 0) or 0)
+        headers = getattr(err, "headers", None)
+        content_type = headers.get("Content-Type", "") if headers is not None else ""
+        try:
+            charset = headers.get_content_charset() if headers is not None else None
+        except Exception:
+            charset = None
+        charset = charset or "utf-8"
+        try:
+            data = err.read(MAX_TOOL_CHARS * 4 + 1) if getattr(err, "fp", None) is not None else b""
+        except Exception:
+            data = b""
         truncated = len(data) > MAX_TOOL_CHARS * 4
         if truncated:
             data = data[: MAX_TOOL_CHARS * 4]
         text = data.decode(charset, errors="replace")
+        reason = getattr(err, "reason", "") or ""
+        error = f"HTTPError {status}: {reason}".strip()
+    except URLError as err:
+        status = 0
+        content_type = ""
+        truncated = False
+        text = ""
+        error = f"URLError: {getattr(err, 'reason', err)}"
+    except Exception as err:
+        status = 0
+        content_type = ""
+        truncated = False
+        text = ""
+        error = f"{err.__class__.__name__}: {err}"
 
     if strip_html_content and "text/html" in content_type.lower():
         text = _strip_html(text)
@@ -126,13 +162,16 @@ def _fetch_url(
         text = text[:max_chars]
         truncated = True
 
-    return {
+    payload: dict[str, str | int | bool] = {
         "url": url,
         "status": status,
         "content_type": content_type,
         "truncated": truncated,
         "content": text,
     }
+    if error:
+        payload["error"] = error
+    return payload
 
 
 def _strip_html(raw_html: str) -> str:
@@ -162,6 +201,8 @@ def _search_searxng(query: str, max_results: int) -> dict[str, object]:
     )
     url = f"{SEARXNG_URL}/search?{params}"
     response = _fetch_url(url, MAX_TOOL_CHARS * 4, strip_html_content=False)
+    if response.get("error"):
+        raise ValueError(f"SearXNG fetch failed: {response['error']}")
     payload = json.loads(str(response["content"]))
 
     raw_results = payload.get("results", [])
@@ -212,11 +253,13 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
     )
 
     @agent.tool
+    @safe_tool("get_current_time")
     def get_current_time(ctx: RunContext[SessionContext]) -> str:
         """Get the current local time."""
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     @agent.tool
+    @safe_tool("get_random_number")
     def get_random_number(
         ctx: RunContext[SessionContext], min_val: int = 1, max_val: int = 100
     ) -> str:
@@ -224,6 +267,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         return str(random.randint(min_val, max_val))
 
     @agent.tool
+    @safe_tool("list_directory")
     def list_directory(
         ctx: RunContext[SessionContext],
         path: str = ".",
@@ -255,6 +299,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         return _json(entries)
 
     @agent.tool
+    @safe_tool("read_text_file")
     def read_text_file(
         ctx: RunContext[SessionContext], path: str, max_chars: int = MAX_TOOL_CHARS
     ) -> str:
@@ -264,6 +309,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         return _read_text(file_path, safe_max_chars)
 
     @agent.tool
+    @safe_tool("write_text_file")
     def write_text_file(ctx: RunContext[SessionContext], path: str, content: str) -> str:
         """Write UTF-8 text to a file in the workspace (overwrite)."""
         file_path = _resolve_workspace_path(path)
@@ -272,6 +318,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         return f"Wrote {len(content)} chars to {_to_workspace_relative(file_path)}"
 
     @agent.tool
+    @safe_tool("append_text_file")
     def append_text_file(ctx: RunContext[SessionContext], path: str, content: str) -> str:
         """Append UTF-8 text to a file in the workspace."""
         file_path = _resolve_workspace_path(path)
@@ -281,6 +328,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         return f"Appended {len(content)} chars to {_to_workspace_relative(file_path)}"
 
     @agent.tool
+    @safe_tool("search_in_files")
     def search_in_files(
         ctx: RunContext[SessionContext], pattern: str, path: str = ".", max_results: int = 50
     ) -> str:
@@ -318,6 +366,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         return _json(results)
 
     @agent.tool
+    @safe_tool("fetch_url")
     def fetch_url(ctx: RunContext[SessionContext], url: str, max_chars: int = 8000) -> str:
         """Fetch and return web content from a URL."""
         safe_max_chars = max(500, min(max_chars, 50000))
@@ -325,6 +374,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         return _json(result)
 
     @agent.tool
+    @safe_tool("search_web")
     def search_web(ctx: RunContext[SessionContext], query: str, max_results: int = 5) -> str:
         """Search the web via SearXNG JSON API, with DuckDuckGo fallback."""
         safe_max_results = max(1, min(max_results, 10))
@@ -339,11 +389,13 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
                 {
                     "source": "duckduckgo_fallback",
                     "fallback_reason": str(err),
+                    "fetch_error": response.get("error"),
                     "results": parser.results[:safe_max_results],
                 }
             )
 
     @agent.tool
+    @safe_tool("run_sql")
     def run_sql(
         ctx: RunContext[SessionContext], sql: str, max_rows: int = 200
     ) -> str:
@@ -356,37 +408,51 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         db_path = ctx.deps.memory_store.sqlite_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with sqlite3.connect(db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            if _looks_like_query(query):
-                cur.execute(query)
-                rows = cur.fetchmany(safe_max_rows + 1)
-                truncated = len(rows) > safe_max_rows
-                rows = rows[:safe_max_rows]
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                if _looks_like_query(query):
+                    cur.execute(query)
+                    rows = cur.fetchmany(safe_max_rows + 1)
+                    truncated = len(rows) > safe_max_rows
+                    rows = rows[:safe_max_rows]
+                    payload = {
+                        "ok": True,
+                        "db_path": str(db_path),
+                        "query": query,
+                        "row_count": len(rows),
+                        "truncated": truncated,
+                        "rows": [dict(row) for row in rows],
+                    }
+                    return _json(payload)
+
+                if ";" in query.strip().rstrip(";"):
+                    cur.executescript(query)
+                else:
+                    cur.execute(query)
+                conn.commit()
                 payload = {
+                    "ok": True,
                     "db_path": str(db_path),
                     "query": query,
-                    "row_count": len(rows),
-                    "truncated": truncated,
-                    "rows": [dict(row) for row in rows],
+                    "total_changes": conn.total_changes,
+                    "status": "ok",
                 }
                 return _json(payload)
-
-            if ";" in query.strip().rstrip(";"):
-                cur.executescript(query)
-            else:
-                cur.execute(query)
-            conn.commit()
-            payload = {
-                "db_path": str(db_path),
-                "query": query,
-                "total_changes": conn.total_changes,
-                "status": "ok",
-            }
-            return _json(payload)
+        except sqlite3.Error as err:
+            return _json(
+                {
+                    "ok": False,
+                    "db_path": str(db_path),
+                    "query": query,
+                    "error_type": err.__class__.__name__,
+                    "error": str(err),
+                }
+            )
 
     @agent.tool
+    @safe_tool("describe_sql_schema")
     def describe_sql_schema(ctx: RunContext[SessionContext]) -> str:
         """Show SQLite schema objects from memory/memory.sqlite3."""
         db_path = ctx.deps.memory_store.sqlite_path
@@ -406,6 +472,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
     if enable_dangerzone:
 
         @agent.tool
+        @safe_tool("run_bash_command")
         def run_bash_command(
             ctx: RunContext[SessionContext],
             command: str,
@@ -476,6 +543,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
             )
 
     @agent.tool
+    @safe_tool("switch_to_journaling")
     def switch_to_journaling(ctx: RunContext[SessionContext]) -> str:
         """Run journaling and memory-updater states."""
         ctx.deps.request_transition("journaling", "user requested reflection and memory updates")

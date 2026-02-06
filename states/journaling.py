@@ -7,6 +7,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from debug_auth import get_openrouter_api_key
 from machine import SessionContext, StateConfig
+from tool_utils import safe_tool
 
 
 def create_journaling_state() -> StateConfig:
@@ -49,6 +50,7 @@ def create_journaling_state() -> StateConfig:
     )
 
     @agent.tool
+    @safe_tool("save_journal_entry")
     def save_journal_entry(ctx: RunContext[SessionContext], entry: str) -> str:
         """Save a journal entry to the session log."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -57,6 +59,7 @@ def create_journaling_state() -> StateConfig:
         return f"Journal entry saved. ({len(ctx.deps.journal_entries)} total)"
 
     @agent.tool
+    @safe_tool("get_journal_entries")
     def get_journal_entries(ctx: RunContext[SessionContext]) -> str:
         """Retrieve all journal entries from this session."""
         if not ctx.deps.journal_entries:

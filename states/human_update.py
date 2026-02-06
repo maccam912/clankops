@@ -6,6 +6,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from debug_auth import get_openrouter_api_key
 from machine import SessionContext, StateConfig
+from tool_utils import safe_tool
 
 
 def create_human_update_state() -> StateConfig:
@@ -38,12 +39,14 @@ def create_human_update_state() -> StateConfig:
     )
 
     @agent.tool
+    @safe_tool("keep_human_as_is")
     def keep_human_as_is(ctx: RunContext[SessionContext], reason: str = "") -> str:
         """Keep the HUMAN block unchanged."""
         detail = f" Reason: {reason}" if reason else ""
         return f"HUMAN kept as-is.{detail}"
 
     @agent.tool
+    @safe_tool("rewrite_human")
     def rewrite_human(ctx: RunContext[SessionContext], new_human: str, reason: str = "") -> str:
         """Rewrite the HUMAN block."""
         ctx.deps.set_human_block(new_human)
