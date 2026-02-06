@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import sys
 from dataclasses import dataclass, field
+from datetime import timezone, datetime
+import os
 from typing import Awaitable, Callable
 
 from pydantic_ai import Agent
@@ -206,6 +208,8 @@ class StateMachine:
         self._pending_auto_run = False
         self._input_reader = input_reader or self._read_stdin
         self._response_sink = response_sink
+        self._scheduled_timer_task: asyncio.Task | None = None
+        self._scheduled_timer_target_utc: int | None = None
 
     def add_state(self, config: StateConfig):
         self.states[config.name] = config
@@ -259,9 +263,37 @@ class StateMachine:
             if state.idle_timeout and state.idle_target and has_interaction:
                 timer_task = asyncio.create_task(asyncio.sleep(state.idle_timeout))
 
+            # Set up scheduled self-message timer (persisted in SQLite).
+            stuck_seconds = int(os.environ.get("SCHEDULE_STUCK_SECONDS", "300") or "300")
+            self.context.memory_store.reclaim_stuck_delivering(stuck_seconds=max(30, min(stuck_seconds, 3600)))
+            next_deliver_at = self.context.memory_store.next_pending_self_message_time_utc()
+            scheduled_task = self._scheduled_timer_task
+            if next_deliver_at is None:
+                if scheduled_task is not None and not scheduled_task.done():
+                    scheduled_task.cancel()
+                scheduled_task = None
+                self._scheduled_timer_task = None
+                self._scheduled_timer_target_utc = None
+            else:
+                # If we don't have a timer, or it targets the wrong time (e.g. a new earlier schedule),
+                # create a new one.
+                delay = max(0.0, float(next_deliver_at) - datetime.now(tz=timezone.utc).timestamp())
+                if (
+                    scheduled_task is None
+                    or scheduled_task.done()
+                    or self._scheduled_timer_target_utc != int(next_deliver_at)
+                ):
+                    if scheduled_task is not None and not scheduled_task.done():
+                        scheduled_task.cancel()
+                    scheduled_task = asyncio.create_task(asyncio.sleep(delay))
+                    self._scheduled_timer_task = scheduled_task
+                    self._scheduled_timer_target_utc = int(next_deliver_at)
+
             wait_for: list[asyncio.Task] = [input_task]
             if timer_task:
                 wait_for.append(timer_task)
+            if scheduled_task:
+                wait_for.append(scheduled_task)
 
             done, _ = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
 
@@ -285,6 +317,12 @@ class StateMachine:
                 self.transition_to(state.idle_target, f"idle for {state.idle_timeout}s")
                 continue
 
+            elif scheduled_task and scheduled_task in done:
+                # Deliver any due scheduled self-messages by running them through standard state.
+                self._scheduled_timer_task = None
+                await self._deliver_scheduled_self_messages()
+                continue
+
     async def _run_agent(self, state: StateConfig, user_input: str):
         """Run the agent for the given state with user input."""
         prompt = f"{self.context.memory_blocks_prompt()}\n\nUSER INPUT:\n{user_input}"
@@ -305,6 +343,57 @@ class StateMachine:
                 print(f"[machine] Response sink error: {sink_err}")
 
         self._check_transition()
+
+    async def _deliver_scheduled_self_messages(self):
+        # Fetch due messages from SQLite and run them through the standard agent so they have access
+        # to the broadest toolset (and avoid journaling/identity update constraints).
+        if "standard" not in self.states:
+            return
+
+        claimed = self.context.memory_store.claim_due_self_messages(limit=10)
+        if not claimed:
+            return
+
+        standard_state = self.states["standard"]
+        for item in claimed:
+            msg_id = int(item["id"])
+            created_at = int(item["created_at_utc"])
+            deliver_at = int(item["deliver_at_utc"])
+            message = str(item["message"])
+
+            created_h = datetime.fromtimestamp(created_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            deliver_h = datetime.fromtimestamp(deliver_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            wrapped = (
+                "SCHEDULED SELF MESSAGE\n"
+                "(This message was previously scheduled and persisted; it may be delivered after a restart.)\n"
+                f"ID: {msg_id}\n"
+                f"Created: {created_h}\n"
+                f"Scheduled for: {deliver_h}\n\n"
+                f"{message}"
+            )
+
+            self.context.log_event("user", wrapped, "scheduled")
+            response = await self._run_agent_with_rate_limit_retry(
+                standard_state,
+                f"{self.context.memory_blocks_prompt()}\n\nUSER INPUT:\n{wrapped}",
+                message_history=self._histories.get("standard", []),
+            )
+            if response is None:
+                self.context.memory_store.mark_self_message_failed(
+                    message_id=msg_id, error="Agent run failed while delivering scheduled message.", retry_delay_seconds=60
+                )
+                continue
+
+            self.context.log_event("assistant", response, "standard")
+            print(f"[standard]: {response}")
+            if self._response_sink is not None:
+                try:
+                    await self._response_sink(response)
+                except Exception as sink_err:
+                    print(f"[machine] Response sink error: {sink_err}")
+
+            self.context.memory_store.mark_self_message_delivered(message_id=msg_id)
+            self._check_transition()
 
     async def _run_agent_autonomous(self):
         """Run the current state's agent without user input (e.g. journaling on idle)."""

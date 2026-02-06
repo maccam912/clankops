@@ -39,6 +39,9 @@ Thumbs.db
 # Local assistant tooling
 .claude/
 
+# MCP local config overrides (may contain secrets)
+.mcp/servers.local.json
+
 # Project runtime data
 memory/memory.sqlite3
 memory/journal/

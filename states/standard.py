@@ -18,6 +18,8 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from debug_auth import get_openrouter_api_key
 from machine import SessionContext, StateConfig
+import mcp_runtime
+import scheduler_utils
 import skills_store
 from tool_utils import safe_tool
 
@@ -257,14 +259,20 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
             "path, e.g. 'skills'.)\n"
         )
 
+    mcp = mcp_runtime.McpRuntime(WORKSPACE_ROOT)
+    mcp_section = mcp.format_for_system_prompt()
+
     agent: Agent[SessionContext, str] = Agent(
         model,
         system_prompt=(
             "You are a helpful assistant with broad tools for local files, web research, and SQLite. "
             "Use tools for factual/structured tasks instead of guessing. "
             "When writing files or running SQL, be explicit about what changed. "
-            "If the user wants reflection or memory updates, call switch_to_journaling."
+            "If the user wants reflection or memory updates, call switch_to_journaling. "
+            "Only call fast_forward_to_journaling if the user explicitly asks you to skip waiting and journal now."
+            " Only call schedule_self_message if the user explicitly asks you to schedule a message/reminder to yourself."
             + skills_section
+            + mcp_section
         ),
         deps_type=SessionContext,
     )
@@ -487,6 +495,86 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         return _json([dict(row) for row in rows])
 
     @agent.tool
+    @safe_tool("list_mcp_servers")
+    def list_mcp_servers(ctx: RunContext[SessionContext]) -> str:
+        """Discover configured MCP servers from well-known config locations."""
+        _ = ctx
+        return json.dumps(mcp.list_servers(), indent=2, ensure_ascii=False)
+
+    @agent.tool
+    @safe_tool("reload_mcp_servers")
+    def reload_mcp_servers(ctx: RunContext[SessionContext]) -> str:
+        """Reload MCP server configuration from disk."""
+        _ = ctx
+        return json.dumps(mcp.reload(), indent=2, ensure_ascii=False)
+
+    @agent.tool
+    @safe_tool("mcp_connect")
+    async def mcp_connect(ctx: RunContext[SessionContext], server_name: str) -> str:
+        """Connect to an MCP server (kept alive for the session)."""
+        _ = ctx
+        payload = await mcp.ensure_connected(server_name)
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    @agent.tool
+    @safe_tool("mcp_disconnect")
+    async def mcp_disconnect(ctx: RunContext[SessionContext], server_name: str) -> str:
+        """Disconnect from an MCP server."""
+        _ = ctx
+        payload = await mcp.disconnect(server_name)
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    @agent.tool
+    @safe_tool("mcp_list_tools")
+    async def mcp_list_tools(ctx: RunContext[SessionContext], server_name: str) -> str:
+        """List tools exposed by an MCP server."""
+        _ = ctx
+        payload = await mcp.list_tools(server_name)
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    @agent.tool
+    @safe_tool("mcp_call_tool")
+    async def mcp_call_tool(
+        ctx: RunContext[SessionContext],
+        server_name: str,
+        tool_name: str,
+        arguments: dict[str, object] | None = None,
+        max_result_chars: int = MAX_TOOL_CHARS,
+    ) -> str:
+        """Call a tool on an MCP server."""
+        _ = ctx
+        safe_max = max(500, min(int(max_result_chars), 100_000))
+        payload = await mcp.call_tool(
+            server_name=server_name,
+            tool_name=tool_name,
+            arguments=arguments or None,
+            max_result_chars=safe_max,
+        )
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    @agent.tool
+    @safe_tool("mcp_list_resources")
+    async def mcp_list_resources(ctx: RunContext[SessionContext], server_name: str) -> str:
+        """List resources exposed by an MCP server."""
+        _ = ctx
+        payload = await mcp.list_resources(server_name)
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    @agent.tool
+    @safe_tool("mcp_read_resource")
+    async def mcp_read_resource(
+        ctx: RunContext[SessionContext],
+        server_name: str,
+        uri: str,
+        max_result_chars: int = MAX_TOOL_CHARS,
+    ) -> str:
+        """Read a resource from an MCP server."""
+        _ = ctx
+        safe_max = max(500, min(int(max_result_chars), 100_000))
+        payload = await mcp.read_resource(server_name, uri=uri, max_result_chars=safe_max)
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    @agent.tool
     @safe_tool("list_skills")
     def list_skills(ctx: RunContext[SessionContext], max_skills: int = 50) -> str:
         """List available skills (skill_id + description)."""
@@ -625,6 +713,50 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         """Run journaling and memory-updater states."""
         ctx.deps.request_transition("journaling", "user requested reflection and memory updates")
         return "Switching to journaling and memory update flow now."
+
+    @agent.tool
+    @safe_tool("fast_forward_to_journaling")
+    def fast_forward_to_journaling(ctx: RunContext[SessionContext]) -> str:
+        """Immediately transition to journaling (skip idle timeout).
+
+        Do not call this tool unless the user explicitly asks to skip waiting and journal now.
+        """
+        ctx.deps.request_transition("journaling", "user requested fast-forward to journaling")
+        return "Fast-forwarding to journaling now (skipping idle timeout)."
+
+    @agent.tool
+    @safe_tool("schedule_self_message")
+    def schedule_self_message(ctx: RunContext[SessionContext], when: str, message: str) -> str:
+        """Schedule a future message to the agent (persisted in SQLite for restart safety).
+
+        'when' supports ISO-8601 (recommended) or relative strings like "in 10 minutes".
+        Do not call this tool unless the user explicitly asks to schedule a message/reminder.
+        """
+        parsed = scheduler_utils.parse_when_to_utc_epoch(when)
+        result = ctx.deps.memory_store.schedule_self_message(
+            deliver_at_utc=parsed.deliver_at_utc,
+            message=message,
+        )
+        result = dict(result)
+        result["interpreted_as"] = parsed.interpreted_as
+        result["deliver_at_utc_human"] = scheduler_utils.format_utc_epoch(parsed.deliver_at_utc)
+        return _json(result)
+
+    @agent.tool
+    @safe_tool("list_scheduled_self_messages")
+    def list_scheduled_self_messages(
+        ctx: RunContext[SessionContext], status: str | None = None, limit: int = 50
+    ) -> str:
+        """List scheduled self-messages from SQLite."""
+        rows = ctx.deps.memory_store.list_scheduled_self_messages(status=status, limit=limit)
+        return _json({"ok": True, "rows": rows})
+
+    @agent.tool
+    @safe_tool("cancel_scheduled_self_message")
+    def cancel_scheduled_self_message(ctx: RunContext[SessionContext], message_id: int) -> str:
+        """Cancel a scheduled self-message."""
+        payload = ctx.deps.memory_store.cancel_scheduled_self_message(message_id=message_id)
+        return _json(payload)
 
     return StateConfig(
         name="standard",
