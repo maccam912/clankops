@@ -134,13 +134,23 @@ class SessionContext:
         except Exception as err:
             self.log_event("warning", f"Failed to append journal entry: {err}")
 
-    def memory_blocks_prompt(self) -> str:
+    def memory_blocks_prompt(self, recent_journal_entries: int = 5) -> str:
+        n = max(0, min(int(recent_journal_entries), 20))
+        recent = self.journal_entries[-n:] if n and self.journal_entries else []
+        if recent:
+            journal_lines = [f"{i}. {entry}" for i, entry in enumerate(recent, 1)]
+            journal_block = "\n".join(journal_lines)
+        else:
+            journal_block = "(No journal entries yet.)"
+
         return (
             "MEMORY BLOCKS\n"
             "IDENTITY:\n"
             f"{self.identity_block}\n\n"
             "HUMAN:\n"
-            f"{self.human_block}"
+            f"{self.human_block}\n\n"
+            "RECENT JOURNAL ENTRIES:\n"
+            f"{journal_block}"
         )
 
     def recent_conversation(self, n: int = 10) -> str:
