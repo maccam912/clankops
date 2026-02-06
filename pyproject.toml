@@ -1,0 +1,10 @@
+[project]
+name = "clankops"
+version = "0.1.0"
+description = "A state machine for orchestrating AI agents with contextual tools and transitions"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic-ai>=1.55.0",
+    "python-dotenv>=1.0.0",
+]
