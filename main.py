@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+import logfire
+
 from debug_auth import openrouter_api_key_parts
 from machine import StateMachine
 from states import (
@@ -16,6 +18,8 @@ from states import (
 )
 from telegram_io import TelegramIO
 
+logfire.configure()
+logfire.instrument_pydantic_ai()
 
 def main():
     parser = argparse.ArgumentParser(description="Run clankops state machine")
