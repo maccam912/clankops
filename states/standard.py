@@ -18,6 +18,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from debug_auth import get_openrouter_api_key
 from machine import SessionContext, StateConfig
+import skills_store
 from tool_utils import safe_tool
 
 IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT", "30"))
@@ -75,9 +76,11 @@ def _decode_ddg_redirect(url: str) -> str:
     return url
 
 
-def _resolve_workspace_path(raw_path: str) -> Path:
+def _resolve_workspace_path(raw_path: str, *, allow_outside_workspace: bool = False) -> Path:
     user_path = Path(raw_path.strip() or ".")
     candidate = user_path.resolve() if user_path.is_absolute() else (WORKSPACE_ROOT / user_path).resolve()
+    if allow_outside_workspace:
+        return candidate
     if candidate == WORKSPACE_ROOT or WORKSPACE_ROOT in candidate.parents:
         return candidate
     raise ValueError(f"Path must stay inside workspace: {WORKSPACE_ROOT}")
@@ -241,6 +244,19 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         provider=provider,
     )
 
+    allow_outside_workspace = bool(enable_dangerzone)
+
+    skills_section = ""
+    try:
+        skills_section = skills_store.format_skills_for_system_prompt(WORKSPACE_ROOT)
+    except Exception:
+        # Skills are optional; prompt should still work if the directory is missing/misconfigured.
+        skills_section = (
+            "\n\nSKILLS\n"
+            "(Skills unavailable: could not load SKILLS_DIR. You can configure SKILLS_DIR to a workspace-relative "
+            "path, e.g. 'skills'.)\n"
+        )
+
     agent: Agent[SessionContext, str] = Agent(
         model,
         system_prompt=(
@@ -248,6 +264,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
             "Use tools for factual/structured tasks instead of guessing. "
             "When writing files or running SQL, be explicit about what changed. "
             "If the user wants reflection or memory updates, call switch_to_journaling."
+            + skills_section
         ),
         deps_type=SessionContext,
     )
@@ -275,7 +292,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         max_entries: int = 200,
     ) -> str:
         """List files/directories in the workspace (optionally recursive)."""
-        target = _resolve_workspace_path(path)
+        target = _resolve_workspace_path(path, allow_outside_workspace=allow_outside_workspace)
         if not target.exists():
             return f"Path not found: {path}"
         if not target.is_dir():
@@ -305,14 +322,14 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
     ) -> str:
         """Read a UTF-8 text file from the workspace."""
         safe_max_chars = max(1, min(max_chars, 50000))
-        file_path = _resolve_workspace_path(path)
+        file_path = _resolve_workspace_path(path, allow_outside_workspace=allow_outside_workspace)
         return _read_text(file_path, safe_max_chars)
 
     @agent.tool
     @safe_tool("write_text_file")
     def write_text_file(ctx: RunContext[SessionContext], path: str, content: str) -> str:
         """Write UTF-8 text to a file in the workspace (overwrite)."""
-        file_path = _resolve_workspace_path(path)
+        file_path = _resolve_workspace_path(path, allow_outside_workspace=allow_outside_workspace)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} chars to {_to_workspace_relative(file_path)}"
@@ -321,7 +338,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
     @safe_tool("append_text_file")
     def append_text_file(ctx: RunContext[SessionContext], path: str, content: str) -> str:
         """Append UTF-8 text to a file in the workspace."""
-        file_path = _resolve_workspace_path(path)
+        file_path = _resolve_workspace_path(path, allow_outside_workspace=allow_outside_workspace)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with file_path.open("a", encoding="utf-8") as f:
             f.write(content)
@@ -333,7 +350,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         ctx: RunContext[SessionContext], pattern: str, path: str = ".", max_results: int = 50
     ) -> str:
         """Regex-search text files in the workspace and return matching lines."""
-        target = _resolve_workspace_path(path)
+        target = _resolve_workspace_path(path, allow_outside_workspace=allow_outside_workspace)
         if not target.exists():
             return f"Path not found: {path}"
 
@@ -468,6 +485,66 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
                 """
             ).fetchall()
         return _json([dict(row) for row in rows])
+
+    @agent.tool
+    @safe_tool("list_skills")
+    def list_skills(ctx: RunContext[SessionContext], max_skills: int = 50) -> str:
+        """List available skills (skill_id + description)."""
+        _ = ctx
+        safe_max = max(1, min(int(max_skills), 200))
+        metas = skills_store.list_skills(WORKSPACE_ROOT, max_skills=safe_max)
+        return _json(
+            [
+                {
+                    "skill_id": meta.skill_id,
+                    "name": meta.name,
+                    "description": meta.description,
+                    "path": str(meta.path),
+                }
+                for meta in metas
+            ]
+        )
+
+    @agent.tool
+    @safe_tool("read_skill")
+    def read_skill(
+        ctx: RunContext[SessionContext], skill_id: str, max_chars: int = MAX_TOOL_CHARS
+    ) -> str:
+        """Read a skill's SKILL.md markdown (use this to load full instructions)."""
+        _ = ctx
+        safe_max = max(200, min(int(max_chars), 100_000))
+        payload = skills_store.read_skill_markdown(WORKSPACE_ROOT, skill_id, max_chars=safe_max)
+        return _json(payload)
+
+    @agent.tool
+    @safe_tool("upsert_skill")
+    def upsert_skill(
+        ctx: RunContext[SessionContext],
+        skill_id: str,
+        description: str,
+        body_markdown: str,
+        display_name: str | None = None,
+        overwrite: bool = True,
+    ) -> str:
+        """Create or edit a skill at SKILLS_DIR/<skill_id>/SKILL.md."""
+        _ = ctx
+        payload = skills_store.upsert_skill(
+            WORKSPACE_ROOT,
+            skill_id=skill_id,
+            description=description,
+            body_markdown=body_markdown,
+            display_name=display_name,
+            overwrite=bool(overwrite),
+        )
+        return _json(payload)
+
+    @agent.tool
+    @safe_tool("delete_skill")
+    def delete_skill(ctx: RunContext[SessionContext], skill_id: str, confirm: bool = False) -> str:
+        """Delete a skill directory. Requires confirm=True."""
+        _ = ctx
+        payload = skills_store.delete_skill(WORKSPACE_ROOT, skill_id=skill_id, confirm=bool(confirm))
+        return _json(payload)
 
     if enable_dangerzone:
 
