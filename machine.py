@@ -12,6 +12,48 @@ from debug_auth import print_exception_debug
 from memory_store import MemoryStore
 
 
+RATE_LIMIT_WAIT_SECONDS = 60
+RATE_LIMIT_RECOVERY_INSTRUCTION = (
+    "We just hit a provider rate limit (HTTP 429). After this retry, respond as concisely as possible. "
+    "If you cannot fully complete the task, it's OK to give a partial answer and stop. "
+    "Avoid extra tool calls unless absolutely necessary."
+)
+
+
+def _is_rate_limit_error(err: Exception) -> bool:
+    status_code = getattr(err, "status_code", None)
+    if status_code == 429:
+        return True
+
+    body = getattr(err, "body", None)
+    if isinstance(body, dict):
+        if body.get("code") == 429:
+            return True
+        nested = body.get("error")
+        if isinstance(nested, dict) and nested.get("code") == 429:
+            return True
+
+    msg = str(err).lower()
+    return "rate limit" in msg or "429" in msg
+
+
+def _rate_limit_detail(err: Exception) -> str:
+    model_name = getattr(err, "model_name", None)
+    body = getattr(err, "body", None)
+
+    message: str | None = None
+    if isinstance(body, dict):
+        raw = body.get("message")
+        if isinstance(raw, str) and raw.strip():
+            message = raw.strip()
+
+    if not message:
+        message = str(err).strip()
+
+    model_part = f" model={model_name}" if model_name else ""
+    return f"{message}{model_part}"
+
+
 @dataclass
 class SessionContext:
     """Shared mutable state passed as deps to all agents.
@@ -236,25 +278,21 @@ class StateMachine:
     async def _run_agent(self, state: StateConfig, user_input: str):
         """Run the agent for the given state with user input."""
         prompt = f"{self.context.memory_blocks_prompt()}\n\nUSER INPUT:\n{user_input}"
-        try:
-            result = await state.agent.run(
-                prompt,
-                deps=self.context,
-                message_history=self._histories[state.name],
-            )
-            response = result.output
-            self._histories[state.name] = result.all_messages()
-            self.context.log_event("assistant", response, state.name)
-            print(f"[{state.name}]: {response}")
-            if self._response_sink is not None:
-                try:
-                    await self._response_sink(response)
-                except Exception as sink_err:
-                    print(f"[machine] Response sink error: {sink_err}")
-        except Exception as e:
-            print(f"[{state.name}] Error: {e}")
-            print_exception_debug(state.name, e)
+        response = await self._run_agent_with_rate_limit_retry(
+            state,
+            prompt,
+            message_history=self._histories[state.name],
+        )
+        if response is None:
             return
+
+        self.context.log_event("assistant", response, state.name)
+        print(f"[{state.name}]: {response}")
+        if self._response_sink is not None:
+            try:
+                await self._response_sink(response)
+            except Exception as sink_err:
+                print(f"[machine] Response sink error: {sink_err}")
 
         self._check_transition()
 
@@ -270,14 +308,12 @@ class StateMachine:
             "Please proceed with your task."
         )
 
-        try:
-            result = await state.agent.run(
-                prompt,
-                deps=self.context,
-                message_history=self._histories.get(state.name, []),
-            )
-            response = result.output
-            self._histories[state.name] = result.all_messages()
+        response = await self._run_agent_with_rate_limit_retry(
+            state,
+            prompt,
+            message_history=self._histories.get(state.name, []),
+        )
+        if response is not None:
             self.context.log_event("assistant", response, state.name)
             print(f"[{state.name}]: {response}")
             if self._response_sink is not None:
@@ -285,15 +321,61 @@ class StateMachine:
                     await self._response_sink(response)
                 except Exception as sink_err:
                     print(f"[machine] Response sink error: {sink_err}")
-        except Exception as e:
-            print(f"[{state.name}] Error: {e}")
-            print_exception_debug(state.name, e)
 
         # Check for tool-requested transition first
         if not self._check_transition():
             # Auto-return if configured and no explicit transition was requested
             if state.auto_return:
                 self.transition_to(state.auto_return, "task complete")
+
+    async def _run_agent_with_rate_limit_retry(
+        self,
+        state: StateConfig,
+        prompt: str,
+        message_history: list[ModelMessage],
+    ) -> str | None:
+        """Run agent once, and retry once on rate limit after a fixed wait."""
+        try:
+            result = await state.agent.run(
+                prompt,
+                deps=self.context,
+                message_history=message_history,
+            )
+            self._histories[state.name] = result.all_messages()
+            return result.output
+        except Exception as err:
+            if not _is_rate_limit_error(err):
+                print(f"[{state.name}] Error: {err}")
+                print_exception_debug(state.name, err)
+                return None
+
+            detail = _rate_limit_detail(err)
+            msg = (
+                f"[{state.name}] Rate limit encountered (429). Waiting {RATE_LIMIT_WAIT_SECONDS}s then retrying. "
+                f"({detail})"
+            )
+            print(msg)
+            if self._response_sink is not None:
+                try:
+                    await self._response_sink(msg)
+                except Exception as sink_err:
+                    print(f"[machine] Response sink error: {sink_err}")
+
+            await asyncio.sleep(RATE_LIMIT_WAIT_SECONDS)
+
+            retry_prompt = f"{prompt}\n\nRATE LIMIT RECOVERY:\n{RATE_LIMIT_RECOVERY_INSTRUCTION}"
+            try:
+                result = await state.agent.run(
+                    retry_prompt,
+                    deps=self.context,
+                    message_history=message_history,
+                )
+                self._histories[state.name] = result.all_messages()
+                return result.output
+            except Exception as retry_err:
+                print(f"[{state.name}] Error after rate-limit wait: {retry_err}")
+                print_exception_debug(state.name, retry_err)
+                return None
 
     def _check_transition(self) -> bool:
         """Check if any tool requested a transition. Returns True if one occurred."""
