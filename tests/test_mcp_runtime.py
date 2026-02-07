@@ -65,3 +65,17 @@ def test_standard_state_includes_mcp_tools(monkeypatch: pytest.MonkeyPatch, tmp_
     assert "mcp servers" in prompt
     assert "demo" in prompt
 
+
+def test_build_stdio_env_inherits_process_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ATPROTO_IDENTIFIER", "alice.bsky.social")
+    monkeypatch.setenv("ATPROTO_PASSWORD", "app-password")
+
+    import mcp_runtime
+
+    env = mcp_runtime._build_stdio_env(None)
+    assert env["ATPROTO_IDENTIFIER"] == "alice.bsky.social"
+    assert env["ATPROTO_PASSWORD"] == "app-password"
+
+    env2 = mcp_runtime._build_stdio_env({"ATPROTO_IDENTIFIER": "bob.bsky.social"})
+    assert env2["ATPROTO_IDENTIFIER"] == "bob.bsky.social"
+    assert env2["ATPROTO_PASSWORD"] == "app-password"

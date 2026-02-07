@@ -69,6 +69,29 @@ def _resolve_cwd(workspace_root: Path, cwd: str | None) -> str | None:
     return str(resolved)
 
 
+def _build_stdio_env(overrides: dict[str, Any] | None) -> dict[str, str]:
+    """Build the environment for stdio MCP servers.
+
+    The upstream MCP stdio transport inherits only a small "safe" set of env vars by
+    default. For local dev, clankops expects MCP servers to see the current process
+    environment (including variables loaded from `.env`) while still allowing per-server
+    overrides.
+    """
+    merged: dict[str, str] = dict(os.environ)
+    if not overrides:
+        return merged
+
+    for k, v in overrides.items():
+        key = str(k).strip()
+        if not key:
+            continue
+        if v is None:
+            merged.pop(key, None)
+            continue
+        merged[key] = str(v)
+    return merged
+
+
 def _config_search_paths(workspace_root: Path) -> list[Path]:
     # Precedence: lowest to highest, later files override earlier ones.
     return [
@@ -221,7 +244,7 @@ class McpRuntime:
                 params = StdioServerParameters(
                     command=str(cfg.command or "").strip(),
                     args=list(cfg.args or []),
-                    env=dict(cfg.env or {}) or None,
+                    env=_build_stdio_env(cfg.env),
                     cwd=_resolve_cwd(self._workspace_root, cfg.cwd),
                     encoding="utf-8",
                     encoding_error_handler="replace",
@@ -423,4 +446,11 @@ class McpRuntime:
                 break
             lines.append(line)
             used += len(line)
-        return header + "".join(lines)
+        notes: list[str] = []
+        if "bluesky" in self._configs:
+            notes.append(
+                "\nNotes:\n"
+                "- bluesky (atproto-mcp): auth is automatic from env vars `ATPROTO_IDENTIFIER` and `ATPROTO_PASSWORD` "
+                "(Bluesky App Password). If those are set, you generally do not need OAuth tools.\n"
+            )
+        return header + "".join(lines) + "".join(notes)
