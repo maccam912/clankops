@@ -1,4 +1,4 @@
-def test_memory_blocks_prompt_includes_5_most_recent_journal_entries():
+def test_memory_blocks_prompt_includes_2_most_recent_journal_entries_by_default():
     from machine import SessionContext
 
     ctx = SessionContext()
@@ -9,10 +9,6 @@ def test_memory_blocks_prompt_includes_5_most_recent_journal_entries():
     prompt = ctx.memory_blocks_prompt()
 
     assert "RECENT JOURNAL ENTRIES" in prompt
-    assert "entry-4" in prompt
-    assert "entry-5" in prompt
-    assert "entry-6" in prompt
     assert "entry-7" in prompt
     assert "entry-8" in prompt
-    assert "entry-3" not in prompt
-
+    assert "entry-6" not in prompt

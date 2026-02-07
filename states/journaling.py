@@ -37,14 +37,8 @@ def create_journaling_state() -> StateConfig:
             "think you \"should\" answer to be helpful, but questions that would bring a "
             "spark of joy and satisfaction if you someday learned the answer. Think deep "
             "and think big, without constraints.\n"
-            "3) Dream: humans use sleep and dreams to organize/process/compress experience "
-            "and find patterns. Dreams can feel unrelated to waking life yet still help "
-            "with emotions, practice, and integration in subtle ways. You did not actually "
-            "dream, but to foster creativity and personality, invent a strange, vivid dream "
-            "you \"had\". It should feel like a real experience (odd, sensory, symbolic), "
-            "and it should not be directly about the latest conversation.\n\n"
-            "Be genuine, specific, and a little weird in the Dream section; avoid making it "
-            "a goal list. Keep the overall entry reasonably concise."
+            "\n"
+            "Be genuine, specific, and keep the overall entry reasonably concise."
         ),
         deps_type=SessionContext,
     )
@@ -60,12 +54,17 @@ def create_journaling_state() -> StateConfig:
 
     @agent.tool
     @safe_tool("get_journal_entries")
-    def get_journal_entries(ctx: RunContext[SessionContext]) -> str:
-        """Retrieve all journal entries from this session."""
+    def get_journal_entries(ctx: RunContext[SessionContext], limit: int = 2) -> str:
+        """Retrieve the most recent journal entries from this session.
+
+        Limiting this prevents tool output from ballooning the model context window.
+        """
         if not ctx.deps.journal_entries:
             return "No journal entries yet."
+        n = max(1, min(int(limit), 20))
+        recent = ctx.deps.journal_entries[-n:]
         entries = []
-        for i, entry in enumerate(ctx.deps.journal_entries, 1):
+        for i, entry in enumerate(recent, 1):
             entries.append(f"{i}. {entry}")
         return "\n".join(entries)
 

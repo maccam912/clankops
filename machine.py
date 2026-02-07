@@ -5,10 +5,12 @@ import sys
 from dataclasses import dataclass, field
 from datetime import timezone, datetime
 import os
+from functools import lru_cache
 from typing import Awaitable, Callable
 
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
+import tiktoken
 
 from debug_auth import print_exception_debug
 from memory_store import MemoryStore
@@ -54,6 +56,130 @@ def _rate_limit_detail(err: Exception) -> str:
 
     model_part = f" model={model_name}" if model_name else ""
     return f"{message}{model_part}"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+@lru_cache(maxsize=1)
+def _token_encoder():
+    # Prefer the 200k encoding (best fit for modern large-context models), fall back if unavailable.
+    try:
+        return tiktoken.get_encoding("o200k_base")
+    except Exception:
+        return tiktoken.get_encoding("cl100k_base")
+
+
+def _count_tokens(text: str) -> int:
+    if not text:
+        return 0
+    enc = _token_encoder()
+    return len(enc.encode(text, disallowed_special=()))
+
+
+def _truncate_text_middle_by_tokens(text: str, max_tokens: int) -> str:
+    """Truncate text to <= max_tokens, keeping the start and end with a marker in the middle."""
+    if max_tokens <= 0:
+        return ""
+    if not text:
+        return text
+
+    enc = _token_encoder()
+    toks = enc.encode(text, disallowed_special=())
+    if len(toks) <= max_tokens:
+        return text
+
+    # Keep some head to preserve instructions/context labels, and tail to keep most recent details.
+    head = min(256, max_tokens // 4)
+    tail = max(0, max_tokens - head)
+    head_toks = toks[:head]
+    tail_toks = toks[-tail:] if tail else []
+    marker = "\n\n[...context truncated to fit model context window...]\n\n"
+    combined = enc.decode(head_toks) + marker + enc.decode(tail_toks)
+
+    # Paranoia: ensure we didn't exceed due to marker expansion.
+    while _count_tokens(combined) > max_tokens and head > 0:
+        head = max(0, head - 16)
+        head_toks = toks[:head]
+        combined = enc.decode(head_toks) + marker + enc.decode(tail_toks)
+    while _count_tokens(combined) > max_tokens and tail > 0:
+        tail = max(0, tail - 16)
+        tail_toks = toks[-tail:] if tail else []
+        combined = enc.decode(head_toks) + marker + enc.decode(tail_toks)
+
+    return combined
+
+
+def _model_message_to_text(msg: ModelMessage) -> str:
+    """Convert pydantic-ai messages to plain-ish text so we can estimate tokens."""
+    kind = getattr(msg, "kind", None)
+    parts = getattr(msg, "parts", None)
+    if not parts:
+        return str(msg)
+
+    chunks: list[str] = []
+    if kind == "request":
+        instructions = getattr(msg, "instructions", None)
+        if isinstance(instructions, str) and instructions.strip():
+            chunks.append(instructions.strip())
+    for p in parts:
+        content = getattr(p, "content", None)
+        if isinstance(content, str):
+            chunks.append(content)
+            continue
+        if content is not None:
+            chunks.append(str(content))
+            continue
+        tool_name = getattr(p, "tool_name", None)
+        if isinstance(tool_name, str) and tool_name.strip():
+            chunks.append(f"tool:{tool_name}")
+        args = getattr(p, "args", None)
+        if args is not None:
+            chunks.append(str(args))
+    return "\n".join(chunks)
+
+
+def _fit_prompt_and_history_to_context(
+    *,
+    prompt: str,
+    message_history: list[ModelMessage],
+    max_context_tokens: int,
+    max_completion_tokens: int,
+    margin_tokens: int,
+) -> tuple[str, list[ModelMessage], int]:
+    """Ensure (history + prompt + completion + margin) fits in the model context window."""
+    max_context_tokens = max(4096, int(max_context_tokens))
+    margin_tokens = max(0, int(margin_tokens))
+    max_completion_tokens = max(256, int(max_completion_tokens))
+
+    if max_completion_tokens + margin_tokens > max_context_tokens:
+        max_completion_tokens = max(256, max_context_tokens - margin_tokens)
+
+    budget = max_context_tokens - max_completion_tokens - margin_tokens
+    budget = max(512, budget)
+
+    hist = list(message_history or [])
+
+    def total_tokens(h: list[ModelMessage], p: str) -> int:
+        t = _count_tokens(p)
+        for m in h:
+            t += _count_tokens(_model_message_to_text(m))
+        return t
+
+    while hist and total_tokens(hist, prompt) > budget:
+        hist.pop(0)
+
+    if total_tokens(hist, prompt) > budget:
+        prompt = _truncate_text_middle_by_tokens(prompt, budget)
+
+    return prompt, hist, max_completion_tokens
 
 
 @dataclass
@@ -136,7 +262,7 @@ class SessionContext:
         except Exception as err:
             self.log_event("warning", f"Failed to append journal entry: {err}")
 
-    def memory_blocks_prompt(self, recent_journal_entries: int = 5) -> str:
+    def memory_blocks_prompt(self, recent_journal_entries: int = 2) -> str:
         n = max(0, min(int(recent_journal_entries), 20))
         recent = self.journal_entries[-n:] if n and self.journal_entries else []
         if recent:
@@ -330,6 +456,7 @@ class StateMachine:
             state,
             prompt,
             message_history=self._histories[state.name],
+            max_completion_tokens=_env_int("MAX_COMPLETION_TOKENS", 4096),
         )
         if response is None:
             return
@@ -377,6 +504,7 @@ class StateMachine:
                 standard_state,
                 f"{self.context.memory_blocks_prompt()}\n\nUSER INPUT:\n{wrapped}",
                 message_history=self._histories.get("standard", []),
+                max_completion_tokens=_env_int("MAX_COMPLETION_TOKENS", 4096),
             )
             if response is None:
                 self.context.memory_store.mark_self_message_failed(
@@ -410,7 +538,9 @@ class StateMachine:
         response = await self._run_agent_with_rate_limit_retry(
             state,
             prompt,
-            message_history=self._histories.get(state.name, []),
+            # Autonomous states shouldn't accumulate history indefinitely.
+            message_history=[],
+            max_completion_tokens=_env_int("AUTONOMOUS_MAX_COMPLETION_TOKENS", 2048),
         )
         if response is not None:
             self.context.log_event("assistant", response, state.name)
@@ -432,15 +562,30 @@ class StateMachine:
         state: StateConfig,
         prompt: str,
         message_history: list[ModelMessage],
+        max_completion_tokens: int,
     ) -> str | None:
         """Run agent once, and retry once on rate limit after a fixed wait."""
+        max_history = _env_int("MAX_MESSAGE_HISTORY", 50)
+        trimmed_history = list(message_history or [])[-max(0, int(max_history)) :]
+
+        max_context_tokens = _env_int("MODEL_CONTEXT_LENGTH", 256000)
+        margin_tokens = _env_int("PROMPT_TOKEN_MARGIN", 2048)
+        fitted_prompt, fitted_history, fitted_max_completion = _fit_prompt_and_history_to_context(
+            prompt=prompt,
+            message_history=trimmed_history,
+            max_context_tokens=max_context_tokens,
+            max_completion_tokens=max_completion_tokens,
+            margin_tokens=margin_tokens,
+        )
         try:
             result = await state.agent.run(
-                prompt,
+                fitted_prompt,
                 deps=self.context,
-                message_history=message_history,
+                message_history=fitted_history,
+                model_settings={"max_tokens": fitted_max_completion},
             )
-            self._histories[state.name] = result.all_messages()
+            all_msgs = result.all_messages()
+            self._histories[state.name] = list(all_msgs)[-max(0, int(max_history)) :]
             return result.output
         except Exception as err:
             if not _is_rate_limit_error(err):
@@ -462,14 +607,23 @@ class StateMachine:
 
             await asyncio.sleep(RATE_LIMIT_WAIT_SECONDS)
 
-            retry_prompt = f"{prompt}\n\nRATE LIMIT RECOVERY:\n{RATE_LIMIT_RECOVERY_INSTRUCTION}"
+            retry_prompt = f"{fitted_prompt}\n\nRATE LIMIT RECOVERY:\n{RATE_LIMIT_RECOVERY_INSTRUCTION}"
             try:
-                result = await state.agent.run(
-                    retry_prompt,
-                    deps=self.context,
-                    message_history=message_history,
+                retry_fitted_prompt, retry_fitted_history, retry_fitted_max_completion = _fit_prompt_and_history_to_context(
+                    prompt=retry_prompt,
+                    message_history=fitted_history,
+                    max_context_tokens=max_context_tokens,
+                    max_completion_tokens=fitted_max_completion,
+                    margin_tokens=margin_tokens,
                 )
-                self._histories[state.name] = result.all_messages()
+                result = await state.agent.run(
+                    retry_fitted_prompt,
+                    deps=self.context,
+                    message_history=retry_fitted_history,
+                    model_settings={"max_tokens": retry_fitted_max_completion},
+                )
+                all_msgs = result.all_messages()
+                self._histories[state.name] = list(all_msgs)[-max(0, int(max_history)) :]
                 return result.output
             except Exception as retry_err:
                 print(f"[{state.name}] Error after rate-limit wait: {retry_err}")

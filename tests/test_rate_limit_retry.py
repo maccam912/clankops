@@ -32,7 +32,7 @@ async def test_rate_limit_waits_and_retries_with_recovery_prompt(monkeypatch):
         sink_msgs.append(msg)
 
     class DummyAgent:
-        async def run(self, prompt, deps=None, message_history=None):  # noqa: ANN001
+        async def run(self, prompt, deps=None, message_history=None, model_settings=None):  # noqa: ANN001
             calls.append(str(prompt))
             if len(calls) == 1:
                 raise _RateLimitErr()
@@ -44,10 +44,9 @@ async def test_rate_limit_waits_and_retries_with_recovery_prompt(monkeypatch):
     state = StateConfig(name="standard", agent=DummyAgent())
     m.add_state(state)
 
-    out = await m._run_agent_with_rate_limit_retry(state, "hello", message_history=[])
+    out = await m._run_agent_with_rate_limit_retry(state, "hello", message_history=[], max_completion_tokens=1024)
     assert out == "ok after retry"
     assert slept == [RATE_LIMIT_WAIT_SECONDS]
     assert len(calls) == 2
     assert "RATE LIMIT RECOVERY" in calls[1]
     assert any("Rate limit encountered" in s for s in sink_msgs)
-
