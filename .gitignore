@@ -42,8 +42,5 @@ Thumbs.db
 # MCP local config overrides (may contain secrets)
 .mcp/servers.local.json
 
-# Project runtime data
-memory/memory.sqlite3
-memory/journal/
-memory/identity.txt
-memory/human.txt
+# Project runtime data (never commit)
+memory/

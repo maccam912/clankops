@@ -31,6 +31,34 @@ WEB_TIMEOUT_SECONDS = float(os.environ.get("WEB_TIMEOUT_SECONDS", "15"))
 WEB_USER_AGENT = "clankops-agent/0.1 (+https://example.local)"
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng.k3s.koski.co").strip().rstrip("/")
 
+def _coerce_json_object(value: object | None) -> dict[str, object] | None:
+    """Accept either a dict or a JSON object string and return a dict.
+
+    Pydantic tool-arg validation happens before `safe_tool()` can catch errors.
+    Some models emit JSON as a string for object-typed tool params; accept and
+    parse that here to avoid aborting the whole run.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        # Coerce keys to str to match MCP's expectation.
+        return {str(k): v for k, v in value.items()}
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw or raw.lower() in ("null", "none"):
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as err:
+            raise ValueError("arguments must be a JSON object (e.g. {'limit': 5}).") from err
+        if parsed is None:
+            return None
+        if not isinstance(parsed, dict):
+            raise ValueError("arguments must be a JSON object (not a list/string/number).")
+        return {str(k): v for k, v in parsed.items()}
+    raise TypeError("arguments must be an object/dict or a JSON object string.")
+
 
 class _DuckDuckGoResultParser(HTMLParser):
     def __init__(self):
@@ -538,16 +566,17 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         ctx: RunContext[SessionContext],
         server_name: str,
         tool_name: str,
-        arguments: dict[str, object] | None = None,
+        arguments: dict[str, object] | str | None = None,
         max_result_chars: int = MAX_TOOL_CHARS,
     ) -> str:
         """Call a tool on an MCP server."""
         _ = ctx
         safe_max = max(500, min(int(max_result_chars), 100_000))
+        parsed_args = _coerce_json_object(arguments)
         payload = await mcp.call_tool(
             server_name=server_name,
             tool_name=tool_name,
-            arguments=arguments or None,
+            arguments=parsed_args or None,
             max_result_chars=safe_max,
         )
         return json.dumps(payload, indent=2, ensure_ascii=False)

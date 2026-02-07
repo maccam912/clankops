@@ -6,7 +6,13 @@
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "--root", "."],
       "env": {},
       "cwd": "."
+    },
+    "bluesky": {
+      "transport": "stdio",
+      "command": "bash",
+      "args": ["-lc", "./scripts/atproto-mcp-stdio.sh"],
+      "env": {},
+      "cwd": "."
     }
   }
 }
-

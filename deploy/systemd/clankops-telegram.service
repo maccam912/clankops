@@ -1,0 +1,32 @@
+[Unit]
+Description=clankops Telegram daemon (uv run python main.py --telegram --dangerzone)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/root/clankops
+
+# Load secrets/config if present. Keep secrets out of git.
+EnvironmentFile=-/root/clankops/.env
+
+# Make sure logs show up promptly in journald.
+Environment=PYTHONUNBUFFERED=1
+
+# Override these in a systemd drop-in if you move the repo, uv, or add flags like --dangerzone.
+Environment=UV_BIN=/root/.local/bin/uv
+Environment="CLANKOPS_ARGS=--telegram --dangerzone"
+
+ExecStart=/root/clankops/scripts/clankops-telegram.sh
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+SuccessExitStatus=130 143
+
+SyslogIdentifier=clankops-telegram
+
+[Install]
+WantedBy=multi-user.target
