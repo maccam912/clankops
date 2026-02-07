@@ -68,8 +68,11 @@ class MemoryStore:
                     created_at_utc INTEGER NOT NULL,
                     deliver_at_utc INTEGER NOT NULL,
                     message TEXT NOT NULL,
+                    recurrence_seconds INTEGER, -- NULL for one-off; otherwise interval in seconds
+                    end_at_utc INTEGER, -- NULL means run forever
                     status TEXT NOT NULL DEFAULT 'pending', -- pending|delivering|delivered|canceled
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    delivery_count INTEGER NOT NULL DEFAULT 0,
                     updated_at_utc INTEGER NOT NULL,
                     delivered_at_utc INTEGER,
                     canceled_at_utc INTEGER,
@@ -77,6 +80,7 @@ class MemoryStore:
                 )
                 """
             )
+            self._ensure_scheduled_self_messages_columns(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_scheduled_self_messages_pending_deliver "
                 "ON scheduled_self_messages(status, deliver_at_utc)"
@@ -84,10 +88,36 @@ class MemoryStore:
             conn.commit()
 
     @staticmethod
+    def _ensure_scheduled_self_messages_columns(conn: sqlite3.Connection) -> None:
+        existing = set()
+        for row in conn.execute("PRAGMA table_info(scheduled_self_messages)").fetchall():
+            # row[1] is the column name
+            existing.add(str(row[1]))
+
+        # Backwards-compatible migration for databases created before recurring scheduling existed.
+        add_columns: list[str] = []
+        if "recurrence_seconds" not in existing:
+            add_columns.append("recurrence_seconds INTEGER")
+        if "end_at_utc" not in existing:
+            add_columns.append("end_at_utc INTEGER")
+        if "delivery_count" not in existing:
+            add_columns.append("delivery_count INTEGER NOT NULL DEFAULT 0")
+
+        for col_def in add_columns:
+            conn.execute(f"ALTER TABLE scheduled_self_messages ADD COLUMN {col_def}")
+
+    @staticmethod
     def _now_utc_epoch() -> int:
         return int(time.time())
 
-    def schedule_self_message(self, *, deliver_at_utc: int, message: str) -> dict[str, object]:
+    def schedule_self_message(
+        self,
+        *,
+        deliver_at_utc: int,
+        message: str,
+        recurrence_seconds: int | None = None,
+        end_at_utc: int | None = None,
+    ) -> dict[str, object]:
         text = (message or "").strip()
         if not text:
             raise ValueError("message is empty.")
@@ -97,19 +127,41 @@ class MemoryStore:
         if deliver_at < 0:
             raise ValueError("deliver_at_utc must be a positive epoch timestamp.")
 
+        recurrence: int | None = None
+        if recurrence_seconds is not None:
+            recurrence = int(recurrence_seconds)
+            if recurrence <= 0:
+                raise ValueError("recurrence_seconds must be a positive integer (seconds).")
+
+        end_at: int | None = None
+        if end_at_utc is not None:
+            end_at = int(end_at_utc)
+            if end_at < 0:
+                raise ValueError("end_at_utc must be a positive epoch timestamp.")
+
+        if recurrence is not None and end_at is not None and end_at < deliver_at:
+            raise ValueError("end_at_utc must be after the first delivery time.")
+
         with sqlite3.connect(self.sqlite_path) as conn:
             cur = conn.execute(
                 """
                 INSERT INTO scheduled_self_messages (
-                    created_at_utc, deliver_at_utc, message, status, attempts, updated_at_utc
-                ) VALUES (?, ?, ?, 'pending', 0, ?)
+                    created_at_utc, deliver_at_utc, message, recurrence_seconds, end_at_utc, status, attempts, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)
                 """,
-                (now, deliver_at, text, now),
+                (now, deliver_at, text, recurrence, end_at, now),
             )
             conn.commit()
             msg_id = int(cur.lastrowid)
 
-        return {"ok": True, "id": msg_id, "deliver_at_utc": deliver_at, "status": "pending"}
+        return {
+            "ok": True,
+            "id": msg_id,
+            "deliver_at_utc": deliver_at,
+            "recurrence_seconds": recurrence,
+            "end_at_utc": end_at,
+            "status": "pending",
+        }
 
     def list_scheduled_self_messages(
         self, *, status: str | None = None, limit: int = 50
@@ -119,7 +171,8 @@ class MemoryStore:
         params: tuple[object, ...]
         if status_raw:
             sql = (
-                "SELECT id, created_at_utc, deliver_at_utc, status, attempts, updated_at_utc, "
+                "SELECT id, created_at_utc, deliver_at_utc, recurrence_seconds, end_at_utc, status, attempts, "
+                "delivery_count, updated_at_utc, "
                 "delivered_at_utc, canceled_at_utc, last_error, message "
                 "FROM scheduled_self_messages "
                 "WHERE status = ? "
@@ -129,7 +182,8 @@ class MemoryStore:
             params = (status_raw, safe_limit)
         else:
             sql = (
-                "SELECT id, created_at_utc, deliver_at_utc, status, attempts, updated_at_utc, "
+                "SELECT id, created_at_utc, deliver_at_utc, recurrence_seconds, end_at_utc, status, attempts, "
+                "delivery_count, updated_at_utc, "
                 "delivered_at_utc, canceled_at_utc, last_error, message "
                 "FROM scheduled_self_messages "
                 "ORDER BY deliver_at_utc ASC "
@@ -141,6 +195,27 @@ class MemoryStore:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+
+    def expire_ended_recurring(self) -> int:
+        """Mark recurring schedules as complete once their end time has passed.
+
+        Policy: if now is after end_at_utc, we stop without delivering missed occurrences.
+        """
+        now = self._now_utc_epoch()
+        with sqlite3.connect(self.sqlite_path) as conn:
+            cur = conn.execute(
+                """
+                UPDATE scheduled_self_messages
+                SET status = 'delivered', updated_at_utc = ?, last_error = NULL
+                WHERE status = 'pending'
+                  AND recurrence_seconds IS NOT NULL
+                  AND end_at_utc IS NOT NULL
+                  AND end_at_utc < ?
+                """,
+                (now, now),
+            )
+            conn.commit()
+            return int(cur.rowcount)
 
     def cancel_scheduled_self_message(self, *, message_id: int) -> dict[str, object]:
         msg_id = int(message_id)
@@ -174,10 +249,19 @@ class MemoryStore:
             return int(cur.rowcount)
 
     def next_pending_self_message_time_utc(self) -> int | None:
+        self.expire_ended_recurring()
         with sqlite3.connect(self.sqlite_path) as conn:
             row = conn.execute(
                 """
-                SELECT MIN(deliver_at_utc) AS next_deliver
+                SELECT MIN(
+                    CASE
+                        WHEN recurrence_seconds IS NOT NULL
+                             AND end_at_utc IS NOT NULL
+                             AND end_at_utc < deliver_at_utc
+                        THEN end_at_utc
+                        ELSE deliver_at_utc
+                    END
+                ) AS next_deliver
                 FROM scheduled_self_messages
                 WHERE status = 'pending'
                 """
@@ -191,6 +275,8 @@ class MemoryStore:
         safe_limit = max(1, min(int(limit), 50))
         now = self._now_utc_epoch()
 
+        self.expire_ended_recurring()
+
         # Reclaim obviously stuck deliveries before claiming more.
         self.reclaim_stuck_delivering(stuck_seconds=300)
 
@@ -201,11 +287,13 @@ class MemoryStore:
                 """
                 SELECT id, created_at_utc, deliver_at_utc, message, attempts
                 FROM scheduled_self_messages
-                WHERE status = 'pending' AND deliver_at_utc <= ?
+                WHERE status = 'pending'
+                  AND deliver_at_utc <= ?
+                  AND (end_at_utc IS NULL OR ? <= end_at_utc)
                 ORDER BY deliver_at_utc ASC, id ASC
                 LIMIT ?
                 """,
-                (now, safe_limit),
+                (now, now, safe_limit),
             ).fetchall()
             ids = [int(r["id"]) for r in rows]
             if ids:
@@ -239,14 +327,57 @@ class MemoryStore:
         msg_id = int(message_id)
         now = self._now_utc_epoch()
         with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute(
-                """
-                UPDATE scheduled_self_messages
-                SET status = 'delivered', delivered_at_utc = ?, updated_at_utc = ?, last_error = NULL
-                WHERE id = ?
-                """,
-                (now, now, msg_id),
-            )
+            row = conn.execute(
+                "SELECT recurrence_seconds, end_at_utc FROM scheduled_self_messages WHERE id = ?",
+                (msg_id,),
+            ).fetchone()
+
+            recurrence = int(row[0]) if row and row[0] is not None else None
+            end_at = int(row[1]) if row and row[1] is not None else None
+
+            if recurrence is None:
+                conn.execute(
+                    """
+                    UPDATE scheduled_self_messages
+                    SET status = 'delivered',
+                        delivered_at_utc = ?,
+                        delivery_count = delivery_count + 1,
+                        updated_at_utc = ?,
+                        last_error = NULL
+                    WHERE id = ?
+                    """,
+                    (now, now, msg_id),
+                )
+            else:
+                next_deliver_at = now + recurrence
+                if end_at is not None and next_deliver_at > end_at:
+                    # Completed: no further deliveries.
+                    conn.execute(
+                        """
+                        UPDATE scheduled_self_messages
+                        SET status = 'delivered',
+                            delivered_at_utc = ?,
+                            delivery_count = delivery_count + 1,
+                            updated_at_utc = ?,
+                            last_error = NULL
+                        WHERE id = ?
+                        """,
+                        (now, now, msg_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE scheduled_self_messages
+                        SET status = 'pending',
+                            deliver_at_utc = ?,
+                            delivered_at_utc = ?,
+                            delivery_count = delivery_count + 1,
+                            updated_at_utc = ?,
+                            last_error = NULL
+                        WHERE id = ?
+                        """,
+                        (next_deliver_at, now, now, msg_id),
+                    )
             conn.commit()
 
     def mark_self_message_failed(self, *, message_id: int, error: str, retry_delay_seconds: int = 60) -> None:

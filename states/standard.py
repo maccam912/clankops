@@ -5,6 +5,7 @@ import random
 import re
 import sqlite3
 import subprocess
+import time
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -298,7 +299,7 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
             "When writing files or running SQL, be explicit about what changed. "
             "If the user wants reflection or memory updates, call switch_to_journaling. "
             "Only call fast_forward_to_journaling if the user explicitly asks you to skip waiting and journal now."
-            " Only call schedule_self_message if the user explicitly asks you to schedule a message/reminder to yourself."
+            " Only call schedule_self_message if the user explicitly asks you to schedule a one-off or recurring message/reminder to yourself (e.g. 'in an hour' or 'every hour')."
             + skills_section
             + mcp_section
         ),
@@ -755,17 +756,44 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
 
     @agent.tool
     @safe_tool("schedule_self_message")
-    def schedule_self_message(ctx: RunContext[SessionContext], when: str, message: str) -> str:
+    def schedule_self_message(
+        ctx: RunContext[SessionContext], when: str, message: str, until: str | None = None
+    ) -> str:
         """Schedule a future message to the agent (persisted in SQLite for restart safety).
 
-        'when' supports ISO-8601 (recommended) or relative strings like "in 10 minutes".
+        Supports one-off and recurring schedules:
+        - One-off: ISO-8601 (recommended) or relative strings like "in 10 minutes"
+        - Recurring: "every hour", "every 2 hours", "hourly", etc.
+
+        If 'when' is recurring, you may set 'until' to an ISO-8601 timestamp (or relative time)
+        to stop after that time; omit 'until' to repeat forever.
         Do not call this tool unless the user explicitly asks to schedule a message/reminder.
         """
-        parsed = scheduler_utils.parse_when_to_utc_epoch(when)
-        result = ctx.deps.memory_store.schedule_self_message(
-            deliver_at_utc=parsed.deliver_at_utc,
-            message=message,
-        )
+        raw_when = (when or "").strip()
+        if scheduler_utils.is_recurring_when(raw_when):
+            interval_seconds, interpreted = scheduler_utils.parse_every_to_interval_seconds(raw_when)
+            end_at_utc: int | None = None
+            until_raw = (until or "").strip()
+            if until_raw and until_raw.lower() not in ("forever", "none", "null"):
+                until_parsed = scheduler_utils.parse_when_to_utc_epoch(until_raw)
+                end_at_utc = int(until_parsed.deliver_at_utc)
+
+            first_deliver_at = int(time.time()) + int(interval_seconds)
+            result = ctx.deps.memory_store.schedule_self_message(
+                deliver_at_utc=first_deliver_at,
+                message=message,
+                recurrence_seconds=int(interval_seconds),
+                end_at_utc=end_at_utc,
+            )
+            result = dict(result)
+            result["interpreted_as"] = interpreted
+            result["deliver_at_utc_human"] = scheduler_utils.format_utc_epoch(first_deliver_at)
+            if end_at_utc is not None:
+                result["end_at_utc_human"] = scheduler_utils.format_utc_epoch(end_at_utc)
+            return _json(result)
+
+        parsed = scheduler_utils.parse_when_to_utc_epoch(raw_when)
+        result = ctx.deps.memory_store.schedule_self_message(deliver_at_utc=parsed.deliver_at_utc, message=message)
         result = dict(result)
         result["interpreted_as"] = parsed.interpreted_as
         result["deliver_at_utc_human"] = scheduler_utils.format_utc_epoch(parsed.deliver_at_utc)

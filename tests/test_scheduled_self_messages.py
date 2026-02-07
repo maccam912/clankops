@@ -27,6 +27,87 @@ def test_scheduled_self_messages_persist_and_claim(tmp_path: Path, monkeypatch: 
     assert rows[0]["status"] == "delivered"
 
 
+def test_recurring_self_message_reschedules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMORY_DIR", str(tmp_path))
+
+    from memory_store import MemoryStore
+
+    store = MemoryStore()
+    now = int(__import__("time").time())
+
+    created = store.schedule_self_message(
+        deliver_at_utc=now - 5,
+        message="ping",
+        recurrence_seconds=60,
+        end_at_utc=None,
+    )
+    msg_id = int(created["id"])
+
+    claimed = store.claim_due_self_messages(limit=5)
+    assert claimed and int(claimed[0]["id"]) == msg_id
+
+    store.mark_self_message_delivered(message_id=msg_id)
+
+    rows = store.list_scheduled_self_messages(limit=10)
+    row = next(r for r in rows if int(r["id"]) == msg_id)
+    assert row["status"] == "pending"
+    assert int(row["recurrence_seconds"]) == 60
+    assert int(row["delivery_count"]) == 1
+    # Next delivery should be about a minute from now.
+    assert int(row["deliver_at_utc"]) >= now + 40
+    assert int(row["deliver_at_utc"]) <= now + 80
+
+
+def test_recurring_self_message_stops_at_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMORY_DIR", str(tmp_path))
+
+    from memory_store import MemoryStore
+
+    store = MemoryStore()
+    now = int(__import__("time").time())
+
+    # End soon: after the first delivery, the next would be beyond end, so it should complete.
+    created = store.schedule_self_message(
+        deliver_at_utc=now - 5,
+        message="ping",
+        recurrence_seconds=60,
+        end_at_utc=now + 10,
+    )
+    msg_id = int(created["id"])
+
+    claimed = store.claim_due_self_messages(limit=5)
+    assert claimed and int(claimed[0]["id"]) == msg_id
+
+    store.mark_self_message_delivered(message_id=msg_id)
+
+    rows = store.list_scheduled_self_messages(status="delivered", limit=10)
+    assert any(int(r["id"]) == msg_id for r in rows)
+
+
+def test_recurring_is_not_delivered_after_end_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMORY_DIR", str(tmp_path))
+
+    from memory_store import MemoryStore
+
+    store = MemoryStore()
+    now = int(__import__("time").time())
+
+    # This occurrence was due before end, but we are now past end; policy is to stop without delivering.
+    created = store.schedule_self_message(
+        deliver_at_utc=now - 5,
+        message="late ping",
+        recurrence_seconds=60,
+        end_at_utc=now - 1,
+    )
+    msg_id = int(created["id"])
+
+    claimed = store.claim_due_self_messages(limit=5)
+    assert claimed == []
+
+    rows = store.list_scheduled_self_messages(status="delivered", limit=10)
+    assert any(int(r["id"]) == msg_id for r in rows)
+
+
 def test_reclaim_stuck_delivering(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MEMORY_DIR", str(tmp_path))
 

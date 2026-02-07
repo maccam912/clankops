@@ -10,6 +10,10 @@ _IN_RE = re.compile(
     r"(?is)^\s*in\s+(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)\s*$"
 )
 
+_EVERY_RE = re.compile(
+    r"(?is)^\s*every\s+(?:(\d+(?:\.\d+)?)\s*)?(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w)\s*$"
+)
+
 
 @dataclass(frozen=True)
 class ParsedSchedule:
@@ -61,6 +65,48 @@ def parse_when_to_utc_epoch(when: str) -> ParsedSchedule:
     deliver_utc = int(dt.astimezone(timezone.utc).timestamp())
     return ParsedSchedule(deliver_at_utc=deliver_utc, interpreted_as=interpreted)
 
+def is_recurring_when(when: str) -> bool:
+    raw = (when or "").strip().lower()
+    if not raw:
+        return False
+    if raw in ("hourly", "daily", "weekly"):
+        return True
+    return _EVERY_RE.match(raw) is not None
+
+
+def parse_every_to_interval_seconds(when: str) -> tuple[int, str]:
+    """Parse a human-ish recurring schedule spec into an interval in seconds.
+
+    Supported:
+    - "every hour", "every 2 hours", "every 30m", "every 1 day"
+    - "hourly", "daily", "weekly"
+    """
+    raw = (when or "").strip()
+    if not raw:
+        raise ValueError("when is empty.")
+
+    lower = raw.lower().strip()
+    if lower == "hourly":
+        return 60 * 60, "relative (hourly)"
+    if lower == "daily":
+        return 60 * 60 * 24, "relative (daily)"
+    if lower == "weekly":
+        return 60 * 60 * 24 * 7, "relative (weekly)"
+
+    m = _EVERY_RE.match(raw)
+    if not m:
+        raise ValueError(
+            "Could not parse recurring 'when'. Use e.g. 'every hour', 'every 2 hours', or 'every 30m'."
+        )
+
+    amount_text = m.group(1)
+    amount = float(amount_text) if amount_text else 1.0
+    unit = m.group(2).lower()
+    seconds = _to_seconds(amount, unit)
+    if seconds <= 0:
+        raise ValueError("Recurring interval must be positive.")
+    return seconds, f"recurring ({raw.strip()})"
+
 
 def format_utc_epoch(ts: int) -> str:
     dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
@@ -76,5 +122,6 @@ def _to_seconds(amount: float, unit: str) -> int:
         return int(round(amount * 60 * 60))
     if unit in ("day", "days", "d"):
         return int(round(amount * 60 * 60 * 24))
+    if unit in ("week", "weeks", "w"):
+        return int(round(amount * 60 * 60 * 24 * 7))
     raise ValueError(f"Unsupported time unit: {unit}")
-
