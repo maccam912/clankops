@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timezone, datetime
 import os
 from functools import lru_cache
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Sequence
 
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart, UserPromptPart
 import tiktoken
 
 from debug_auth import print_exception_debug
@@ -17,6 +17,59 @@ from memory_store import MemoryStore
 
 
 RATE_LIMIT_WAIT_SECONDS = 60
+
+
+_LEGACY_MEMORY_PREFIX = "MEMORY BLOCKS\nIDENTITY:\n"
+
+
+def _strip_legacy_memory_blocks_from_prompt(text: str) -> str:
+    """Strip legacy inline memory blocks from the start of a prompt, if present.
+
+    Historically, this repo prepended memory blocks into the *user prompt* each turn.
+    That then got persisted into `message_history` and duplicated every subsequent turn.
+    We now pass memory blocks via `Agent.run(..., instructions=...)`; this strips any
+    pre-existing bloated history entries.
+    """
+    if not text or not text.startswith(_LEGACY_MEMORY_PREFIX):
+        return text
+
+    markers = (
+        "\n\nUSER ID:",
+        "\n\nUSER INPUT:",
+        "\n\nRecent conversation",
+    )
+    idxs = [text.find(m) for m in markers if text.find(m) != -1]
+    if not idxs:
+        return text
+    idx = min(idxs)
+    # Drop the leading "\n\n" and keep the rest.
+    return text[idx + 2 :]
+
+
+def _sanitize_message_history(message_history: Sequence[ModelMessage] | None) -> list[ModelMessage]:
+    """Remove system prompt parts + per-run instructions from history, and strip legacy inline memory blocks."""
+    if not message_history:
+        return []
+
+    sanitized: list[ModelMessage] = []
+    for msg in message_history:
+        if isinstance(msg, ModelRequest):
+            new_parts = []
+            for part in msg.parts:
+                if isinstance(part, SystemPromptPart):
+                    continue
+                if isinstance(part, UserPromptPart) and isinstance(part.content, str):
+                    new_content = _strip_legacy_memory_blocks_from_prompt(part.content)
+                    if new_content != part.content:
+                        part = replace(part, content=new_content)
+                new_parts.append(part)
+            if not new_parts:
+                continue
+            sanitized.append(replace(msg, parts=new_parts, instructions=None))
+        else:
+            sanitized.append(msg)
+    return sanitized
+
 
 def _extract_http_status(err: Exception) -> int | None:
     status_code = getattr(err, "status_code", None)
@@ -188,16 +241,18 @@ def _fit_prompt_and_history_to_context(
     max_context_tokens: int,
     max_completion_tokens: int,
     margin_tokens: int,
+    reserved_tokens: int = 0,
 ) -> tuple[str, list[ModelMessage], int]:
     """Ensure (history + prompt + completion + margin) fits in the model context window."""
     max_context_tokens = max(4096, int(max_context_tokens))
     margin_tokens = max(0, int(margin_tokens))
     max_completion_tokens = max(256, int(max_completion_tokens))
+    reserved_tokens = max(0, int(reserved_tokens))
 
     if max_completion_tokens + margin_tokens > max_context_tokens:
         max_completion_tokens = max(256, max_context_tokens - margin_tokens)
 
-    budget = max_context_tokens - max_completion_tokens - margin_tokens
+    budget = max_context_tokens - max_completion_tokens - margin_tokens - reserved_tokens
     budget = max(512, budget)
 
     hist = list(message_history or [])
@@ -538,8 +593,6 @@ class StateMachine:
         uid = int(user_id or 0)
         self.context.set_active_user(uid)
         prompt = (
-            f"{self.context.memory_blocks_prompt()}\n\n"
-            f"USER ID: {uid}\n"
             f"USER INPUT:\n{user_input}"
         )
         response = await self._run_agent_with_rate_limit_retry(
@@ -609,7 +662,7 @@ class StateMachine:
             self.context.log_event("user", wrapped, "scheduled")
             response = await self._run_agent_with_rate_limit_retry(
                 standard_state,
-                f"{self.context.memory_blocks_prompt()}\n\nUSER INPUT:\n{wrapped}",
+                f"USER INPUT:\n{wrapped}",
                 message_history=self._histories.get(("standard", uid), []),
                 max_completion_tokens=_env_int("MAX_COMPLETION_TOKENS", 4096),
             )
@@ -655,8 +708,7 @@ class StateMachine:
 
         recent = self.context.recent_conversation(user_id=uid, n=_env_int("AUTONOMOUS_RECENT_MESSAGES", 20))
         prompt = (
-            f"{self.context.memory_blocks_prompt()}\n\n"
-            f"Recent conversation (user_id={uid}):\n{recent}\n\n"
+            f"Recent conversation:\n{recent}\n\n"
             "Please proceed with your task."
         )
 
@@ -699,15 +751,38 @@ class StateMachine:
         """
         max_history = _env_int("MAX_MESSAGE_HISTORY", 50)
         trimmed_history = list(message_history or [])[-max(0, int(max_history)) :]
+        trimmed_history = _sanitize_message_history(trimmed_history)
 
-        max_context_tokens = _env_int("MODEL_CONTEXT_LENGTH", 256000)
-        margin_tokens = _env_int("PROMPT_TOKEN_MARGIN", 2048)
+        instructions = self.context.memory_blocks_prompt()
+        reserved_tokens = _count_tokens(instructions)
+
+        max_context_tokens = max(4096, int(_env_int("MODEL_CONTEXT_LENGTH", 256000)))
+        margin_tokens = max(0, int(_env_int("PROMPT_TOKEN_MARGIN", 2048)))
+        max_completion_tokens = max(256, int(max_completion_tokens))
+
+        # Ensure completion + margin + reserved fits the model context.
+        if max_completion_tokens + margin_tokens + reserved_tokens > max_context_tokens:
+            max_completion_tokens = max(256, max_context_tokens - margin_tokens - reserved_tokens)
+
+        # Ensure we leave at least some room for prompt+history; truncate instructions if needed.
+        min_prompt_history_budget = 512
+        available = max_context_tokens - max_completion_tokens - margin_tokens - reserved_tokens
+        if available < min_prompt_history_budget:
+            target_reserved = max(
+                0,
+                max_context_tokens - max_completion_tokens - margin_tokens - min_prompt_history_budget,
+            )
+            if target_reserved < reserved_tokens:
+                instructions = _truncate_text_middle_by_tokens(instructions, target_reserved)
+                reserved_tokens = _count_tokens(instructions)
+
         fitted_prompt, fitted_history, fitted_max_completion = _fit_prompt_and_history_to_context(
             prompt=prompt,
             message_history=trimmed_history,
             max_context_tokens=max_context_tokens,
             max_completion_tokens=max_completion_tokens,
             margin_tokens=margin_tokens,
+            reserved_tokens=reserved_tokens,
         )
         consecutive_429 = 0
         consecutive_401 = 0
@@ -718,11 +793,13 @@ class StateMachine:
                     fitted_prompt,
                     deps=self.context,
                     message_history=fitted_history,
+                    instructions=instructions,
                     model_settings={"max_tokens": fitted_max_completion},
                 )
                 all_msgs = result.all_messages()
                 uid = int(self.context.active_user_id or 0)
-                self._histories[(state.name, uid)] = list(all_msgs)[-max(0, int(max_history)) :]
+                sanitized = _sanitize_message_history(list(all_msgs))
+                self._histories[(state.name, uid)] = sanitized[-max(0, int(max_history)) :]
                 return result.output
             except Exception as err:
                 should_retry, bucket = _llm_should_cooldown_and_retry(err)
@@ -806,8 +883,7 @@ class StateMachine:
                 since_seconds=window_seconds,
             )
             prompt = (
-                f"{self.context.memory_blocks_prompt()}\n\n"
-                f"Recent conversation (user_id={uid}, last {window_seconds}s):\n{recent}\n\n"
+                f"Recent conversation (last {window_seconds}s):\n{recent}\n\n"
                 "Please proceed with your task."
             )
             response = await self._run_agent_with_rate_limit_retry(

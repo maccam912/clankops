@@ -36,7 +36,14 @@ async def test_rate_limit_waits_and_retries_reruns_same_prompt(monkeypatch):
         slept.append(seconds)
 
     class DummyAgent:
-        async def run(self, prompt, deps=None, message_history=None, model_settings=None):  # noqa: ANN001
+        async def run(  # noqa: ANN001
+            self,
+            prompt,
+            deps=None,
+            message_history=None,
+            instructions=None,
+            model_settings=None,
+        ):
             calls.append(str(prompt))
             if len(calls) == 1:
                 raise _RateLimitErr()
@@ -67,7 +74,14 @@ async def test_401_waits_and_retries_reruns_same_prompt(monkeypatch):
         slept.append(seconds)
 
     class DummyAgent:
-        async def run(self, prompt, deps=None, message_history=None, model_settings=None):  # noqa: ANN001
+        async def run(  # noqa: ANN001
+            self,
+            prompt,
+            deps=None,
+            message_history=None,
+            instructions=None,
+            model_settings=None,
+        ):
             calls.append(str(prompt))
             if len(calls) == 1:
                 raise _UnauthorizedErr()
@@ -97,7 +111,14 @@ async def test_two_429s_in_a_row_requests_stop(monkeypatch):
         slept.append(seconds)
 
     class DummyAgent:
-        async def run(self, prompt, deps=None, message_history=None, model_settings=None):  # noqa: ANN001
+        async def run(  # noqa: ANN001
+            self,
+            prompt,
+            deps=None,
+            message_history=None,
+            instructions=None,
+            model_settings=None,
+        ):
             raise _RateLimitErr()
 
     monkeypatch.setenv("LLM_CALL_DELAY_SECONDS", "0")
@@ -133,7 +154,14 @@ async def test_llm_call_delay_sleeps_between_calls(monkeypatch):
         loop.t += float(seconds)
 
     class DummyAgent:
-        async def run(self, prompt, deps=None, message_history=None, model_settings=None):  # noqa: ANN001
+        async def run(  # noqa: ANN001
+            self,
+            prompt,
+            deps=None,
+            message_history=None,
+            instructions=None,
+            model_settings=None,
+        ):
             return _DummyResult("ok")
 
     monkeypatch.setenv("LLM_CALL_DELAY_SECONDS", "1.0")
