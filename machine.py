@@ -17,28 +17,46 @@ from memory_store import MemoryStore
 
 
 RATE_LIMIT_WAIT_SECONDS = 60
-RATE_LIMIT_RECOVERY_INSTRUCTION = (
-    "We just hit a provider rate limit (HTTP 429). After this retry, respond as concisely as possible. "
-    "If you cannot fully complete the task, it's OK to give a partial answer and stop. "
-    "Avoid extra tool calls unless absolutely necessary."
-)
 
-
-def _is_rate_limit_error(err: Exception) -> bool:
+def _extract_http_status(err: Exception) -> int | None:
     status_code = getattr(err, "status_code", None)
-    if status_code == 429:
-        return True
+    if isinstance(status_code, int):
+        return status_code
+
+    response = getattr(err, "response", None)
+    response_status = getattr(response, "status_code", None)
+    if isinstance(response_status, int):
+        return response_status
+
+    return None
+
+
+def _llm_should_cooldown_and_retry(err: Exception) -> tuple[bool, int | None]:
+    """Return (should_retry, status_code_bucket).
+
+    `status_code_bucket` is either 429, 401, or None when unknown.
+    Treat 401 like 429 for cooldown/retry purposes (per repo config).
+    """
+    status_code = _extract_http_status(err)
+    if status_code in (429, 401):
+        return True, status_code
 
     body = getattr(err, "body", None)
     if isinstance(body, dict):
-        if body.get("code") == 429:
-            return True
+        code = body.get("code")
+        if code == 429:
+            return True, 429
         nested = body.get("error")
         if isinstance(nested, dict) and nested.get("code") == 429:
-            return True
+            return True, 429
 
     msg = str(err).lower()
-    return "rate limit" in msg or "429" in msg
+    if "rate limit" in msg or "429" in msg:
+        return True, 429
+    if "unauthorized" in msg or " 401" in msg or "401 " in msg:
+        return True, 401
+
+    return False, None
 
 
 def _rate_limit_detail(err: Exception) -> str:
@@ -64,6 +82,16 @@ def _env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw)
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
     except Exception:
         return default
 
@@ -336,6 +364,9 @@ class StateMachine:
         self._response_sink = response_sink
         self._scheduled_timer_task: asyncio.Task | None = None
         self._scheduled_timer_target_utc: int | None = None
+        self._stop_requested = False
+        self._stop_reason = ""
+        self._last_llm_call_at = 0.0
 
     def add_state(self, config: StateConfig):
         self.states[config.name] = config
@@ -373,81 +404,89 @@ class StateMachine:
         print()
 
         input_task = asyncio.create_task(self._input_reader())
+        try:
+            while True:
+                if self._stop_requested:
+                    detail = f": {self._stop_reason}" if self._stop_reason else ""
+                    print(f"[machine] Stopping{detail}")
+                    break
 
-        while True:
-            state = self.current
+                state = self.current
 
-            if self._pending_auto_run:
-                self._pending_auto_run = False
-                await self._run_agent_autonomous()
-                continue
+                if self._pending_auto_run:
+                    self._pending_auto_run = False
+                    await self._run_agent_autonomous()
+                    continue
 
-            # Set up idle timer if configured for this state
-            # BUT only if we've had at least one interaction (so we don't journal empty air at startup)
-            timer_task = None
-            has_interaction = any(e["kind"] in ("user", "assistant") for e in self.context.events)
-            if state.idle_timeout and state.idle_target and has_interaction:
-                timer_task = asyncio.create_task(asyncio.sleep(state.idle_timeout))
+                # Set up idle timer if configured for this state
+                # BUT only if we've had at least one interaction (so we don't journal empty air at startup)
+                timer_task = None
+                has_interaction = any(e["kind"] in ("user", "assistant") for e in self.context.events)
+                if state.idle_timeout and state.idle_target and has_interaction:
+                    timer_task = asyncio.create_task(asyncio.sleep(state.idle_timeout))
 
-            # Set up scheduled self-message timer (persisted in SQLite).
-            stuck_seconds = int(os.environ.get("SCHEDULE_STUCK_SECONDS", "300") or "300")
-            self.context.memory_store.reclaim_stuck_delivering(stuck_seconds=max(30, min(stuck_seconds, 3600)))
-            next_deliver_at = self.context.memory_store.next_pending_self_message_time_utc()
-            scheduled_task = self._scheduled_timer_task
-            if next_deliver_at is None:
-                if scheduled_task is not None and not scheduled_task.done():
-                    scheduled_task.cancel()
-                scheduled_task = None
-                self._scheduled_timer_task = None
-                self._scheduled_timer_target_utc = None
-            else:
-                # If we don't have a timer, or it targets the wrong time (e.g. a new earlier schedule),
-                # create a new one.
-                delay = max(0.0, float(next_deliver_at) - datetime.now(tz=timezone.utc).timestamp())
-                if (
-                    scheduled_task is None
-                    or scheduled_task.done()
-                    or self._scheduled_timer_target_utc != int(next_deliver_at)
-                ):
+                # Set up scheduled self-message timer (persisted in SQLite).
+                stuck_seconds = int(os.environ.get("SCHEDULE_STUCK_SECONDS", "300") or "300")
+                self.context.memory_store.reclaim_stuck_delivering(stuck_seconds=max(30, min(stuck_seconds, 3600)))
+                next_deliver_at = self.context.memory_store.next_pending_self_message_time_utc()
+                scheduled_task = self._scheduled_timer_task
+                if next_deliver_at is None:
                     if scheduled_task is not None and not scheduled_task.done():
                         scheduled_task.cancel()
-                    scheduled_task = asyncio.create_task(asyncio.sleep(delay))
-                    self._scheduled_timer_task = scheduled_task
-                    self._scheduled_timer_target_utc = int(next_deliver_at)
+                    scheduled_task = None
+                    self._scheduled_timer_task = None
+                    self._scheduled_timer_target_utc = None
+                else:
+                    # If we don't have a timer, or it targets the wrong time (e.g. a new earlier schedule),
+                    # create a new one.
+                    delay = max(0.0, float(next_deliver_at) - datetime.now(tz=timezone.utc).timestamp())
+                    if (
+                        scheduled_task is None
+                        or scheduled_task.done()
+                        or self._scheduled_timer_target_utc != int(next_deliver_at)
+                    ):
+                        if scheduled_task is not None and not scheduled_task.done():
+                            scheduled_task.cancel()
+                        scheduled_task = asyncio.create_task(asyncio.sleep(delay))
+                        self._scheduled_timer_task = scheduled_task
+                        self._scheduled_timer_target_utc = int(next_deliver_at)
 
-            wait_for: list[asyncio.Task] = [input_task]
-            if timer_task:
-                wait_for.append(timer_task)
-            if scheduled_task:
-                wait_for.append(scheduled_task)
-
-            done, _ = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
-
-            if input_task in done:
-                raw = input_task.result()
-                if not raw:
-                    # EOF (e.g. Ctrl+D / Ctrl+Z)
-                    print("\n[machine] Input closed.")
-                    break
-                user_input = raw.strip()
+                wait_for: list[asyncio.Task] = [input_task]
                 if timer_task:
-                    timer_task.cancel()
-                input_task = asyncio.create_task(self._input_reader())
+                    wait_for.append(timer_task)
+                if scheduled_task:
+                    wait_for.append(scheduled_task)
 
-                if user_input:
-                    self.context.log_event("user", user_input, state.name)
-                    await self._run_agent(state, user_input)
+                done, _ = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
 
-            elif timer_task and timer_task in done:
-                # Idle timeout fired
-                self.transition_to(state.idle_target, f"idle for {state.idle_timeout}s")
-                continue
+                if input_task in done:
+                    raw = input_task.result()
+                    if not raw:
+                        # EOF (e.g. Ctrl+D / Ctrl+Z)
+                        print("\n[machine] Input closed.")
+                        break
+                    user_input = raw.strip()
+                    if timer_task:
+                        timer_task.cancel()
+                    input_task = asyncio.create_task(self._input_reader())
 
-            elif scheduled_task and scheduled_task in done:
-                # Deliver any due scheduled self-messages by running them through standard state.
-                self._scheduled_timer_task = None
-                await self._deliver_scheduled_self_messages()
-                continue
+                    if user_input:
+                        self.context.log_event("user", user_input, state.name)
+                        await self._run_agent(state, user_input)
+
+                elif timer_task and timer_task in done:
+                    # Idle timeout fired
+                    self.transition_to(state.idle_target, f"idle for {state.idle_timeout}s")
+                    continue
+
+                elif scheduled_task and scheduled_task in done:
+                    # Deliver any due scheduled self-messages by running them through standard state.
+                    self._scheduled_timer_task = None
+                    await self._deliver_scheduled_self_messages()
+                    continue
+        finally:
+            if input_task and not input_task.done():
+                input_task.cancel()
 
     async def _run_agent(self, state: StateConfig, user_input: str):
         """Run the agent for the given state with user input."""
@@ -564,7 +603,14 @@ class StateMachine:
         message_history: list[ModelMessage],
         max_completion_tokens: int,
     ) -> str | None:
-        """Run agent once, and retry once on rate limit after a fixed wait."""
+        """Run agent once, and retry once after cooldown for 429/401.
+
+        Notes:
+        - Adds a configurable per-call delay between LLM calls (env: LLM_CALL_DELAY_SECONDS).
+        - Treats HTTP 401 as rate-limited (cooldown + retry) for now.
+        - Cancels the whole state machine only if we receive the same code twice in a row
+          (two 429s or two 401s).
+        """
         max_history = _env_int("MAX_MESSAGE_HISTORY", 50)
         trimmed_history = list(message_history or [])[-max(0, int(max_history)) :]
 
@@ -577,58 +623,68 @@ class StateMachine:
             max_completion_tokens=max_completion_tokens,
             margin_tokens=margin_tokens,
         )
-        try:
-            result = await state.agent.run(
-                fitted_prompt,
-                deps=self.context,
-                message_history=fitted_history,
-                model_settings={"max_tokens": fitted_max_completion},
-            )
-            all_msgs = result.all_messages()
-            self._histories[state.name] = list(all_msgs)[-max(0, int(max_history)) :]
-            return result.output
-        except Exception as err:
-            if not _is_rate_limit_error(err):
-                print(f"[{state.name}] Error: {err}")
-                print_exception_debug(state.name, err)
-                return None
-
-            detail = _rate_limit_detail(err)
-            msg = (
-                f"[{state.name}] Rate limit encountered (429). Waiting {RATE_LIMIT_WAIT_SECONDS}s then retrying. "
-                f"({detail})"
-            )
-            print(msg)
-            if self._response_sink is not None:
-                try:
-                    await self._response_sink(msg)
-                except Exception as sink_err:
-                    print(f"[machine] Response sink error: {sink_err}")
-
-            await asyncio.sleep(RATE_LIMIT_WAIT_SECONDS)
-
-            retry_prompt = f"{fitted_prompt}\n\nRATE LIMIT RECOVERY:\n{RATE_LIMIT_RECOVERY_INSTRUCTION}"
+        consecutive_429 = 0
+        consecutive_401 = 0
+        for attempt in (1, 2):
             try:
-                retry_fitted_prompt, retry_fitted_history, retry_fitted_max_completion = _fit_prompt_and_history_to_context(
-                    prompt=retry_prompt,
-                    message_history=fitted_history,
-                    max_context_tokens=max_context_tokens,
-                    max_completion_tokens=fitted_max_completion,
-                    margin_tokens=margin_tokens,
-                )
+                await self._llm_call_delay()
                 result = await state.agent.run(
-                    retry_fitted_prompt,
+                    fitted_prompt,
                     deps=self.context,
-                    message_history=retry_fitted_history,
-                    model_settings={"max_tokens": retry_fitted_max_completion},
+                    message_history=fitted_history,
+                    model_settings={"max_tokens": fitted_max_completion},
                 )
                 all_msgs = result.all_messages()
                 self._histories[state.name] = list(all_msgs)[-max(0, int(max_history)) :]
                 return result.output
-            except Exception as retry_err:
-                print(f"[{state.name}] Error after rate-limit wait: {retry_err}")
-                print_exception_debug(state.name, retry_err)
-                return None
+            except Exception as err:
+                should_retry, bucket = _llm_should_cooldown_and_retry(err)
+                if not should_retry:
+                    print(f"[{state.name}] Error: {err}")
+                    print_exception_debug(state.name, err)
+                    return None
+
+                if bucket == 401:
+                    consecutive_401 += 1
+                    consecutive_429 = 0
+                else:
+                    consecutive_429 += 1
+                    consecutive_401 = 0
+
+                if consecutive_429 >= 2:
+                    self._request_stop(f"received HTTP 429 twice in a row from LLM provider ({_rate_limit_detail(err)})")
+                    return None
+                if consecutive_401 >= 2:
+                    self._request_stop(f"received HTTP 401 twice in a row from LLM provider ({_rate_limit_detail(err)})")
+                    return None
+
+                if attempt >= 2:
+                    print(f"[{state.name}] Error after cooldown retry: {err}")
+                    print_exception_debug(state.name, err)
+                    return None
+
+                detail = _rate_limit_detail(err)
+                code_label = "401" if bucket == 401 else "429"
+                print(f"[{state.name}] Provider returned HTTP {code_label}. Cooling down {RATE_LIMIT_WAIT_SECONDS}s then retrying. ({detail})")
+                await asyncio.sleep(RATE_LIMIT_WAIT_SECONDS)
+
+        return None
+
+    async def _llm_call_delay(self) -> None:
+        delay_s = max(0.0, float(_env_float("LLM_CALL_DELAY_SECONDS", 1.0)))
+        if delay_s <= 0.0:
+            return
+
+        now = asyncio.get_running_loop().time()
+        elapsed = now - float(self._last_llm_call_at or 0.0)
+        if elapsed < delay_s:
+            await asyncio.sleep(delay_s - elapsed)
+            now = asyncio.get_running_loop().time()
+        self._last_llm_call_at = now
+
+    def _request_stop(self, reason: str) -> None:
+        self._stop_requested = True
+        self._stop_reason = reason.strip()
 
     def _check_transition(self) -> bool:
         """Check if any tool requested a transition. Returns True if one occurred."""
