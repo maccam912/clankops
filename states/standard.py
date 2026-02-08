@@ -32,6 +32,36 @@ WEB_TIMEOUT_SECONDS = float(os.environ.get("WEB_TIMEOUT_SECONDS", "15"))
 WEB_USER_AGENT = "clankops-agent/0.1 (+https://example.local)"
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng.k3s.koski.co").strip().rstrip("/")
 
+BLUESKY_TEXT_MAX_CHARS = 300
+
+
+def _clip_text(text: str, max_chars: int) -> tuple[str, bool]:
+    if len(text) <= max_chars:
+        return text, False
+    if max_chars <= 3:
+        return text[:max_chars], True
+    clipped = (text[: max_chars - 3]).rstrip() + "..."
+    return clipped[:max_chars], True
+
+
+def _maybe_clip_bluesky_text(
+    server_name: str, tool_name: str, args: dict[str, object] | None
+) -> tuple[dict[str, object] | None, list[str]]:
+    # atproto (Bluesky) posts and replies have a 300 character limit.
+    name = (server_name or "").strip().lower()
+    if name != "bluesky" or not args:
+        return args, []
+    text = args.get("text")
+    if not isinstance(text, str):
+        return args, []
+    clipped, did_clip = _clip_text(text, BLUESKY_TEXT_MAX_CHARS)
+    if not did_clip:
+        return args, []
+    new_args = dict(args)
+    new_args["text"] = clipped
+    return new_args, [f"Adjusted bluesky tool args: clipped 'text' from {len(text)} to {len(clipped)} chars."]
+
+
 def _coerce_json_object(value: object | None) -> dict[str, object] | None:
     """Accept either a dict or a JSON object string and return a dict.
 
@@ -288,8 +318,8 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
             "path, e.g. 'skills'.)\n"
         )
 
-    mcp = mcp_runtime.McpRuntime(WORKSPACE_ROOT)
-    mcp_section = mcp.format_for_system_prompt()
+    # Use a throwaway runtime for system prompt formatting (no connections are opened here).
+    mcp_section = mcp_runtime.McpRuntime(WORKSPACE_ROOT).format_for_system_prompt()
 
     agent: Agent[SessionContext, str] = Agent(
         model,
@@ -527,38 +557,33 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
     @safe_tool("list_mcp_servers")
     def list_mcp_servers(ctx: RunContext[SessionContext]) -> str:
         """Discover configured MCP servers from well-known config locations."""
-        _ = ctx
-        return json.dumps(mcp.list_servers(), indent=2, ensure_ascii=False)
+        return json.dumps(ctx.deps.mcp.list_servers(), indent=2, ensure_ascii=False)
 
     @agent.tool
     @safe_tool("reload_mcp_servers")
     def reload_mcp_servers(ctx: RunContext[SessionContext]) -> str:
         """Reload MCP server configuration from disk."""
-        _ = ctx
-        return json.dumps(mcp.reload(), indent=2, ensure_ascii=False)
+        return json.dumps(ctx.deps.mcp.reload(), indent=2, ensure_ascii=False)
 
     @agent.tool
     @safe_tool("mcp_connect")
     async def mcp_connect(ctx: RunContext[SessionContext], server_name: str) -> str:
         """Connect to an MCP server (kept alive for the session)."""
-        _ = ctx
-        payload = await mcp.ensure_connected(server_name)
+        payload = await ctx.deps.mcp.ensure_connected(server_name)
         return json.dumps(payload, indent=2, ensure_ascii=False)
 
     @agent.tool
     @safe_tool("mcp_disconnect")
     async def mcp_disconnect(ctx: RunContext[SessionContext], server_name: str) -> str:
         """Disconnect from an MCP server."""
-        _ = ctx
-        payload = await mcp.disconnect(server_name)
+        payload = await ctx.deps.mcp.disconnect(server_name)
         return json.dumps(payload, indent=2, ensure_ascii=False)
 
     @agent.tool
     @safe_tool("mcp_list_tools")
     async def mcp_list_tools(ctx: RunContext[SessionContext], server_name: str) -> str:
         """List tools exposed by an MCP server."""
-        _ = ctx
-        payload = await mcp.list_tools(server_name)
+        payload = await ctx.deps.mcp.list_tools(server_name)
         return json.dumps(payload, indent=2, ensure_ascii=False)
 
     @agent.tool
@@ -571,23 +596,25 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         max_result_chars: int = MAX_TOOL_CHARS,
     ) -> str:
         """Call a tool on an MCP server."""
-        _ = ctx
         safe_max = max(500, min(int(max_result_chars), 100_000))
         parsed_args = _coerce_json_object(arguments)
-        payload = await mcp.call_tool(
+        parsed_args, warnings = _maybe_clip_bluesky_text(server_name, tool_name, parsed_args)
+        payload = await ctx.deps.mcp.call_tool(
             server_name=server_name,
             tool_name=tool_name,
             arguments=parsed_args or None,
             max_result_chars=safe_max,
         )
+        if warnings:
+            payload = dict(payload)
+            payload["client_warnings"] = warnings
         return json.dumps(payload, indent=2, ensure_ascii=False)
 
     @agent.tool
     @safe_tool("mcp_list_resources")
     async def mcp_list_resources(ctx: RunContext[SessionContext], server_name: str) -> str:
         """List resources exposed by an MCP server."""
-        _ = ctx
-        payload = await mcp.list_resources(server_name)
+        payload = await ctx.deps.mcp.list_resources(server_name)
         return json.dumps(payload, indent=2, ensure_ascii=False)
 
     @agent.tool
@@ -599,9 +626,8 @@ def create_standard_state(enable_dangerzone: bool = False) -> StateConfig:
         max_result_chars: int = MAX_TOOL_CHARS,
     ) -> str:
         """Read a resource from an MCP server."""
-        _ = ctx
         safe_max = max(500, min(int(max_result_chars), 100_000))
-        payload = await mcp.read_resource(server_name, uri=uri, max_result_chars=safe_max)
+        payload = await ctx.deps.mcp.read_resource(server_name, uri=uri, max_result_chars=safe_max)
         return json.dumps(payload, indent=2, ensure_ascii=False)
 
     @agent.tool

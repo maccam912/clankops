@@ -203,15 +203,20 @@ class McpRuntime:
         self._sources: list[Path] = []
         self._configs: dict[str, McpServerConfig] = {}
         self._connections: dict[str, _McpConnection] = {}
-        self._lock = asyncio.Lock()
+        # NOTE: MCP's stdio transport uses AnyIO cancel scopes that must be exited
+        # from the same task they were entered in. pydantic-ai (and asyncio in
+        # general) may call these methods from different tasks over the lifetime
+        # of a process. To avoid "Attempted to exit cancel scope in a different
+        # task than it was entered in" during disconnect/shutdown, all connection
+        # lifecycle operations are serialized through a dedicated actor task.
+        self._actor_task: asyncio.Task[None] | None = None
+        self._actor_queue: asyncio.Queue[tuple[str, tuple[Any, ...], dict[str, Any], asyncio.Future[Any]]] | None = None
         self.reload()
 
     def reload(self) -> dict[str, Any]:
         self._sources, self._configs = load_mcp_server_configs(self._workspace_root)
-        # Drop connections for servers that were removed.
-        for name in list(self._connections.keys()):
-            if name not in self._configs:
-                self._connections.pop(name, None)
+        # Intentionally do NOT mutate/close live connections here.
+        # Connections are owned by the actor task; tool calls can still use them.
         return {
             "ok": True,
             "sources": [str(p) for p in self._sources],
@@ -235,6 +240,56 @@ class McpRuntime:
                 for cfg in self._configs.values()
             ],
         }
+
+    async def _ensure_actor(self) -> None:
+        if self._actor_task is not None and not self._actor_task.done():
+            return
+        self._actor_queue = asyncio.Queue()
+        self._actor_task = asyncio.create_task(self._actor_main(), name="mcp-runtime")
+
+    async def _actor_call(self, op: str, *args: Any, **kwargs: Any) -> Any:
+        await self._ensure_actor()
+        assert self._actor_queue is not None
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        await self._actor_queue.put((op, args, kwargs, fut))
+        return await fut
+
+    async def _actor_main(self) -> None:
+        assert self._actor_queue is not None
+        try:
+            while True:
+                op, args, kwargs, fut = await self._actor_queue.get()
+                if fut.cancelled():
+                    continue
+                try:
+                    if op == "stop":
+                        fut.set_result(True)
+                        break
+                    if op == "ensure_connected":
+                        res = await self._ensure_connected_impl(*args, **kwargs)
+                    elif op == "disconnect":
+                        res = await self._disconnect_impl(*args, **kwargs)
+                    elif op == "list_tools":
+                        res = await self._list_tools_impl(*args, **kwargs)
+                    elif op == "call_tool":
+                        res = await self._call_tool_impl(*args, **kwargs)
+                    elif op == "list_resources":
+                        res = await self._list_resources_impl(*args, **kwargs)
+                    elif op == "read_resource":
+                        res = await self._read_resource_impl(*args, **kwargs)
+                    elif op == "disconnect_all":
+                        res = await self._disconnect_all_impl()
+                    else:
+                        raise ValueError(f"Unknown MCP op: {op}")
+                    fut.set_result(res)
+                except Exception as exc:
+                    fut.set_exception(exc)
+        finally:
+            # Best-effort cleanup even if the actor is cancelled.
+            try:
+                await self._disconnect_all_impl()
+            except Exception:
+                pass
 
     async def _connect(self, cfg: McpServerConfig) -> _McpConnection:
         # Use an async exit stack so the connection stays open until explicitly closed.
@@ -299,48 +354,55 @@ class McpRuntime:
             await stack.aclose()
             raise
 
+    async def _ensure_connected_impl(self, server_name: str) -> dict[str, Any]:
+        name = (server_name or "").strip()
+        if not name:
+            raise ValueError("server_name is required.")
+
+        if name in self._connections:
+            return {"ok": True, "server": name, "connected": True, "reused": True}
+        cfg = self._configs.get(name)
+        if cfg is None:
+            raise ValueError(f"Unknown MCP server: {name}")
+        conn = await self._connect(cfg)
+        self._connections[name] = conn
+        return {
+            "ok": True,
+            "server": name,
+            "connected": True,
+            "reused": False,
+            "server_info": _dump(conn.server_info),
+        }
+
     async def ensure_connected(self, server_name: str) -> dict[str, Any]:
+        return await self._actor_call("ensure_connected", server_name)
+
+    async def _disconnect_impl(self, server_name: str) -> dict[str, Any]:
         name = (server_name or "").strip()
         if not name:
             raise ValueError("server_name is required.")
 
-        async with self._lock:
-            if name in self._connections:
-                return {"ok": True, "server": name, "connected": True, "reused": True}
-            cfg = self._configs.get(name)
-            if cfg is None:
-                raise ValueError(f"Unknown MCP server: {name}")
-            conn = await self._connect(cfg)
-            self._connections[name] = conn
-            return {
-                "ok": True,
-                "server": name,
-                "connected": True,
-                "reused": False,
-                "server_info": _dump(conn.server_info),
-            }
-
-    async def disconnect(self, server_name: str) -> dict[str, Any]:
-        name = (server_name or "").strip()
-        if not name:
-            raise ValueError("server_name is required.")
-
-        async with self._lock:
-            conn = self._connections.pop(name, None)
+        conn = self._connections.pop(name, None)
         if conn is None:
             return {"ok": True, "server": name, "disconnected": False, "reason": "not connected"}
         await conn.close()
         return {"ok": True, "server": name, "disconnected": True}
 
-    async def list_tools(self, server_name: str) -> dict[str, Any]:
+    async def disconnect(self, server_name: str) -> dict[str, Any]:
+        return await self._actor_call("disconnect", server_name)
+
+    async def _list_tools_impl(self, server_name: str) -> dict[str, Any]:
         name = (server_name or "").strip()
-        await self.ensure_connected(name)
+        await self._ensure_connected_impl(name)
         session = self._connections[name].session
         result = await session.list_tools()
         payload = _dump(result)
         return {"ok": True, "server": name, "result": payload}
 
-    async def call_tool(
+    async def list_tools(self, server_name: str) -> dict[str, Any]:
+        return await self._actor_call("list_tools", server_name)
+
+    async def _call_tool_impl(
         self,
         server_name: str,
         tool_name: str,
@@ -349,7 +411,7 @@ class McpRuntime:
         max_result_chars: int = 12_000,
     ) -> dict[str, Any]:
         name = (server_name or "").strip()
-        await self.ensure_connected(name)
+        await self._ensure_connected_impl(name)
         session = self._connections[name].session
         safe_max = max(500, min(int(max_result_chars), 100_000))
         result = await session.call_tool(name=tool_name, arguments=arguments or None)
@@ -392,16 +454,37 @@ class McpRuntime:
             "result": dumped,
         }
 
-    async def list_resources(self, server_name: str) -> dict[str, Any]:
+    async def call_tool(
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        max_result_chars: int = 12_000,
+    ) -> dict[str, Any]:
+        return await self._actor_call(
+            "call_tool",
+            server_name,
+            tool_name,
+            arguments,
+            max_result_chars=max_result_chars,
+        )
+
+    async def _list_resources_impl(self, server_name: str) -> dict[str, Any]:
         name = (server_name or "").strip()
-        await self.ensure_connected(name)
+        await self._ensure_connected_impl(name)
         session = self._connections[name].session
         result = await session.list_resources()
         return {"ok": True, "server": name, "result": _dump(result)}
 
-    async def read_resource(self, server_name: str, uri: str, *, max_result_chars: int = 12_000) -> dict[str, Any]:
+    async def list_resources(self, server_name: str) -> dict[str, Any]:
+        return await self._actor_call("list_resources", server_name)
+
+    async def _read_resource_impl(
+        self, server_name: str, uri: str, *, max_result_chars: int = 12_000
+    ) -> dict[str, Any]:
         name = (server_name or "").strip()
-        await self.ensure_connected(name)
+        await self._ensure_connected_impl(name)
         session = self._connections[name].session
         safe_max = max(500, min(int(max_result_chars), 100_000))
         result = await session.read_resource(uri=uri)
@@ -416,6 +499,33 @@ class McpRuntime:
         except Exception:
             pass
         return {"ok": True, "server": name, "uri": uri, "truncated": truncated, "result": dumped}
+
+    async def read_resource(self, server_name: str, uri: str, *, max_result_chars: int = 12_000) -> dict[str, Any]:
+        return await self._actor_call("read_resource", server_name, uri, max_result_chars=max_result_chars)
+
+    async def _disconnect_all_impl(self) -> None:
+        conns = list(self._connections.items())
+        self._connections.clear()
+        for _, conn in conns:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+    async def aclose(self) -> None:
+        """Close all open connections and stop the actor task."""
+        if self._actor_task is None:
+            return
+        if self._actor_task.done():
+            return
+        try:
+            await self._actor_call("disconnect_all")
+            await self._actor_call("stop")
+        finally:
+            try:
+                await self._actor_task
+            except Exception:
+                pass
 
     def format_for_system_prompt(self, *, max_chars: int = 1200) -> str:
         header = (

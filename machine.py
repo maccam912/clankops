@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import timezone, datetime
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 
 from pydantic_ai import Agent
@@ -14,6 +15,7 @@ import tiktoken
 
 from debug_auth import print_exception_debug
 from memory_store import MemoryStore
+import mcp_runtime
 
 
 RATE_LIMIT_WAIT_SECONDS = 60
@@ -293,6 +295,7 @@ class SessionContext:
     active_user_id: int = field(default=0, repr=False)
     main_user_id: int = field(default=0, repr=False)
     _human_cache: dict[int, str] = field(default_factory=dict, init=False, repr=False)
+    mcp: mcp_runtime.McpRuntime = field(default_factory=lambda: mcp_runtime.McpRuntime(Path.cwd().resolve()), repr=False)
 
     # Transition signaling - tools set these to request a state change
     _transition_target: str | None = field(default=None, repr=False)
@@ -311,6 +314,13 @@ class SessionContext:
         self.journal_entries = self.memory_store.load_journal_entries()
         # Default active user is main user when available; otherwise 0.
         self.set_active_user(self.main_user_id or 0)
+
+    async def aclose(self) -> None:
+        # Best-effort shutdown; MCP stdio connections need explicit closure to avoid AnyIO cancel-scope errors.
+        try:
+            await self.mcp.aclose()
+        except Exception:
+            pass
 
     def set_active_user(self, user_id: int) -> None:
         uid = int(user_id or 0)
@@ -585,8 +595,11 @@ class StateMachine:
                     await self._deliver_scheduled_self_messages()
                     continue
         finally:
+            if self._scheduled_timer_task is not None and not self._scheduled_timer_task.done():
+                self._scheduled_timer_task.cancel()
             if input_task and not input_task.done():
                 input_task.cancel()
+            await self.context.aclose()
 
     async def _run_agent(self, state: StateConfig, user_id: int, user_input: str):
         """Run the agent for the given state with user input."""
