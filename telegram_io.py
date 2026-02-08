@@ -6,14 +6,21 @@ from dataclasses import dataclass, field
 from urllib.request import Request, urlopen
 
 
+@dataclass(frozen=True)
+class TelegramInboundMessage:
+    user_id: int
+    chat_id: int
+    text: str
+
+
 @dataclass
 class TelegramIO:
     bot_token: str
-    allowed_user_id: int
+    allowed_user_ids: set[int]
     poll_timeout_seconds: int = 30
     request_timeout_seconds: int = 35
     _offset: int = 0
-    _chat_id: int | None = field(default=None, init=False, repr=False)
+    _chat_ids: dict[int, int] = field(default_factory=dict, init=False, repr=False)
 
     def get_me(self) -> dict[str, object]:
         result = self._api_call("getMe", {})
@@ -21,7 +28,7 @@ class TelegramIO:
             raise RuntimeError("Unexpected getMe response.")
         return result
 
-    async def read_message(self) -> str:
+    async def read_message(self) -> TelegramInboundMessage:
         while True:
             try:
                 updates = await asyncio.to_thread(
@@ -54,23 +61,34 @@ class TelegramIO:
                         continue
 
                     from_id = from_user.get("id")
-                    if from_id != self.allowed_user_id:
+                    if not isinstance(from_id, int) or int(from_id) not in self.allowed_user_ids:
                         continue
 
                     chat = message.get("chat")
+                    chat_id: int | None = None
                     if isinstance(chat, dict) and isinstance(chat.get("id"), int):
-                        self._chat_id = int(chat["id"])
+                        chat_id = int(chat["id"])
+                        self._chat_ids[int(from_id)] = chat_id
 
                     text = message.get("text")
                     if isinstance(text, str) and text.strip():
-                        return text.strip()
+                        if chat_id is None:
+                            # Shouldn't happen for normal message updates, but keep the loop robust.
+                            continue
+                        return TelegramInboundMessage(
+                            user_id=int(from_id),
+                            chat_id=int(chat_id),
+                            text=text.strip(),
+                        )
             except Exception as err:
                 print(f"[telegram] read loop error: {err}")
                 await asyncio.sleep(2)
 
-    async def send_message(self, text: str):
-        if self._chat_id is None:
-            print("[telegram] No authorized chat available yet; skipping outbound message.")
+    async def send_message(self, user_id: int, text: str):
+        uid = int(user_id)
+        chat_id = self._chat_ids.get(uid)
+        if chat_id is None:
+            print(f"[telegram] No authorized chat available yet for user_id={uid}; skipping outbound message.")
             return
 
         for chunk in _chunk_text(text, max_chars=4096):
@@ -78,7 +96,7 @@ class TelegramIO:
                 self._api_call,
                 "sendMessage",
                 {
-                    "chat_id": self._chat_id,
+                    "chat_id": int(chat_id),
                     "text": chunk,
                 },
             )

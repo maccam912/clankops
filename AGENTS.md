@@ -4,7 +4,7 @@
 - Core entrypoint: `main.py` (loads environment, validates auth, starts the state machine).
 - Orchestration logic: `machine.py` (`SessionContext`, `StateConfig`, `StateMachine`).
 - State implementations: `states/standard.py`, `states/journaling.py`, `states/identity_update.py`, and `states/human_update.py`.
-- Memory persistence: `memory_store.py` plus `memory/identity.txt`, `memory/human.txt`, `memory/journal/*.txt`, and `memory/memory.sqlite3`.
+- Memory persistence: `memory_store.py` backed by `memory/memory.sqlite3` (identity, per-user human blocks, journal entries, and scheduled messages). Legacy text files under `memory/` may exist for migration/back-compat.
 - Environment templates: `.env.example`; local overrides in `.env` (do not commit secrets).
 - Dependency/runtime metadata: `pyproject.toml`, `uv.lock`, `.python-version` (Python 3.13).
 

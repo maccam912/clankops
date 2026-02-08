@@ -96,6 +96,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+@dataclass(frozen=True)
+class InboundMessage:
+    user_id: int
+    text: str
+    chat_id: int | None = None
+
+
 @lru_cache(maxsize=1)
 def _token_encoder():
     # Prefer the 200k encoding (best fit for modern large-context models), fall back if unavailable.
@@ -228,15 +235,37 @@ class SessionContext:
     memory_store: MemoryStore = field(default_factory=MemoryStore, repr=False)
     identity_block: str = field(default="", repr=False)
     human_block: str = field(default="", repr=False)
+    active_user_id: int = field(default=0, repr=False)
+    main_user_id: int = field(default=0, repr=False)
+    _human_cache: dict[int, str] = field(default_factory=dict, init=False, repr=False)
 
     # Transition signaling - tools set these to request a state change
     _transition_target: str | None = field(default=None, repr=False)
     _transition_reason: str = field(default="", repr=False)
 
     def __post_init__(self):
+        # In telegram mode, TELEGRAM_USER_ID is the main user. In non-telegram mode, this stays 0.
+        if not self.main_user_id:
+            raw = os.environ.get("TELEGRAM_USER_ID", "").strip()
+            try:
+                self.main_user_id = int(raw) if raw else 0
+            except Exception:
+                self.main_user_id = 0
+
         self.identity_block = self.memory_store.load_identity()
-        self.human_block = self.memory_store.load_human()
         self.journal_entries = self.memory_store.load_journal_entries()
+        # Default active user is main user when available; otherwise 0.
+        self.set_active_user(self.main_user_id or 0)
+
+    def set_active_user(self, user_id: int) -> None:
+        uid = int(user_id or 0)
+        self.active_user_id = uid
+        if uid in self._human_cache:
+            self.human_block = self._human_cache[uid]
+            return
+        text = self.memory_store.load_human(user_id=uid)
+        self._human_cache[uid] = text
+        self.human_block = text
 
     def request_transition(self, target: str, reason: str = ""):
         """Called by agent tools to request a state transition."""
@@ -275,8 +304,9 @@ class SessionContext:
         if not text:
             return
         self.human_block = text
+        self._human_cache[int(self.active_user_id or 0)] = text
         try:
-            self.memory_store.save_human(text)
+            self.memory_store.save_human(user_id=int(self.active_user_id or 0), content=text)
         except Exception as err:
             self.log_event("warning", f"Failed to save human block: {err}")
 
@@ -303,22 +333,26 @@ class SessionContext:
             "MEMORY BLOCKS\n"
             "IDENTITY:\n"
             f"{self.identity_block}\n\n"
-            "HUMAN:\n"
+            f"HUMAN (user_id={int(self.active_user_id or 0)}):\n"
             f"{self.human_block}\n\n"
             "RECENT JOURNAL ENTRIES:\n"
             f"{journal_block}"
         )
 
-    def recent_conversation(self, n: int = 10) -> str:
-        """Get a text summary of the last n conversation events."""
-        conv_events = [e for e in self.events if e["kind"] in ("user", "assistant")]
-        recent = conv_events[-n:]
-        if not recent:
+    def recent_conversation(self, *, user_id: int, n: int = 12, since_seconds: int | None = None) -> str:
+        """Get a text rendering of the last n chat messages for a given user."""
+        uid = int(user_id or 0)
+        since_utc: int | None = None
+        if since_seconds is not None:
+            now = int(datetime.now(tz=timezone.utc).timestamp())
+            since_utc = max(0, now - max(0, int(since_seconds)))
+        msgs = self.memory_store.load_recent_chat_messages(user_id=uid, limit=n, since_utc=since_utc)
+        if not msgs:
             return "(No conversation yet.)"
-        lines = []
-        for e in recent:
-            role = "User" if e["kind"] == "user" else "Assistant"
-            lines.append(f"{role}: {e['content']}")
+        lines: list[str] = []
+        for m in msgs:
+            role = "User" if m["role"] == "user" else "Assistant"
+            lines.append(f"{role}: {m['content']}")
         return "\n".join(lines)
 
 
@@ -351,14 +385,15 @@ class StateMachine:
     def __init__(
         self,
         initial_state: str,
-        input_reader: Callable[[], Awaitable[str]] | None = None,
-        response_sink: Callable[[str], Awaitable[None]] | None = None,
+        input_reader: Callable[[], Awaitable[InboundMessage]] | None = None,
+        response_sink: Callable[[int, str], Awaitable[None]] | None = None,
+        main_user_id: int = 0,
     ):
         self.states: dict[str, StateConfig] = {}
-        self.context = SessionContext()
+        self.context = SessionContext(main_user_id=int(main_user_id or 0))
         self.current_state_name = initial_state
         # Per-state conversation history for pydantic-ai message continuity
-        self._histories: dict[str, list[ModelMessage]] = {}
+        self._histories: dict[tuple[str, int], list[ModelMessage]] = {}
         self._pending_auto_run = False
         self._input_reader = input_reader or self._read_stdin
         self._response_sink = response_sink
@@ -370,7 +405,7 @@ class StateMachine:
 
     def add_state(self, config: StateConfig):
         self.states[config.name] = config
-        self._histories[config.name] = []
+        # histories are keyed by (state_name, user_id)
 
     @property
     def current(self) -> StateConfig:
@@ -388,7 +423,9 @@ class StateMachine:
 
         target_state = self.states[target]
         if target_state.clear_on_enter:
-            self._histories[target] = []
+            # Clear per-user histories for this state.
+            for key in [k for k in self._histories.keys() if k[0] == target]:
+                del self._histories[key]
             self.context.events.clear()
 
         self._pending_auto_run = target_state.auto_run_on_enter
@@ -460,19 +497,27 @@ class StateMachine:
                 done, _ = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
 
                 if input_task in done:
-                    raw = input_task.result()
-                    if not raw:
+                    inbound = input_task.result()
+                    if not inbound or not inbound.text:
                         # EOF (e.g. Ctrl+D / Ctrl+Z)
                         print("\n[machine] Input closed.")
                         break
-                    user_input = raw.strip()
                     if timer_task:
                         timer_task.cancel()
                     input_task = asyncio.create_task(self._input_reader())
 
+                    self.context.set_active_user(inbound.user_id)
+                    user_input = inbound.text.strip()
                     if user_input:
+                        self.context.memory_store.append_chat_message(
+                            user_id=int(inbound.user_id),
+                            role="user",
+                            content=user_input,
+                            state=state.name,
+                            chat_id=inbound.chat_id,
+                        )
                         self.context.log_event("user", user_input, state.name)
-                        await self._run_agent(state, user_input)
+                        await self._run_agent(state, inbound.user_id, user_input)
 
                 elif timer_task and timer_task in done:
                     # Idle timeout fired
@@ -488,13 +533,19 @@ class StateMachine:
             if input_task and not input_task.done():
                 input_task.cancel()
 
-    async def _run_agent(self, state: StateConfig, user_input: str):
+    async def _run_agent(self, state: StateConfig, user_id: int, user_input: str):
         """Run the agent for the given state with user input."""
-        prompt = f"{self.context.memory_blocks_prompt()}\n\nUSER INPUT:\n{user_input}"
+        uid = int(user_id or 0)
+        self.context.set_active_user(uid)
+        prompt = (
+            f"{self.context.memory_blocks_prompt()}\n\n"
+            f"USER ID: {uid}\n"
+            f"USER INPUT:\n{user_input}"
+        )
         response = await self._run_agent_with_rate_limit_retry(
             state,
             prompt,
-            message_history=self._histories[state.name],
+            message_history=self._histories.get((state.name, uid), []),
             max_completion_tokens=_env_int("MAX_COMPLETION_TOKENS", 4096),
         )
         if response is None:
@@ -504,10 +555,17 @@ class StateMachine:
         print(f"[{state.name}]: {response}")
         if self._response_sink is not None:
             try:
-                await self._response_sink(response)
+                await self._response_sink(uid, response)
             except Exception as sink_err:
                 print(f"[machine] Response sink error: {sink_err}")
 
+        self.context.memory_store.append_chat_message(
+            user_id=uid,
+            role="assistant",
+            content=response,
+            state=state.name,
+            chat_id=None,
+        )
         self._check_transition()
 
     async def _deliver_scheduled_self_messages(self):
@@ -538,11 +596,21 @@ class StateMachine:
                 f"{message}"
             )
 
+            # Treat scheduled self-messages as belonging to main user for context purposes.
+            uid = int(self.context.main_user_id or 0)
+            self.context.set_active_user(uid)
+            self.context.memory_store.append_chat_message(
+                user_id=uid,
+                role="user",
+                content=wrapped,
+                state="scheduled",
+                chat_id=None,
+            )
             self.context.log_event("user", wrapped, "scheduled")
             response = await self._run_agent_with_rate_limit_retry(
                 standard_state,
                 f"{self.context.memory_blocks_prompt()}\n\nUSER INPUT:\n{wrapped}",
-                message_history=self._histories.get("standard", []),
+                message_history=self._histories.get(("standard", uid), []),
                 max_completion_tokens=_env_int("MAX_COMPLETION_TOKENS", 4096),
             )
             if response is None:
@@ -555,10 +623,17 @@ class StateMachine:
             print(f"[standard]: {response}")
             if self._response_sink is not None:
                 try:
-                    await self._response_sink(response)
+                    await self._response_sink(uid, response)
                 except Exception as sink_err:
                     print(f"[machine] Response sink error: {sink_err}")
 
+            self.context.memory_store.append_chat_message(
+                user_id=uid,
+                role="assistant",
+                content=response,
+                state="standard",
+                chat_id=None,
+            )
             self.context.memory_store.mark_self_message_delivered(message_id=msg_id)
             self._check_transition()
 
@@ -566,11 +641,22 @@ class StateMachine:
         """Run the current state's agent without user input (e.g. journaling on idle)."""
         state = self.current
 
-        # Build a context-aware prompt for autonomous invocation
-        recent = self.context.recent_conversation()
+        if state.name == "human_update":
+            await self._run_human_updates_for_recent_users()
+            # Check for tool-requested transition first
+            if not self._check_transition():
+                if state.auto_return:
+                    self.transition_to(state.auto_return, "task complete")
+            return
+
+        # Journaling + identity updates should be grounded in the main user's chat.
+        uid = int(self.context.main_user_id or 0)
+        self.context.set_active_user(uid)
+
+        recent = self.context.recent_conversation(user_id=uid, n=_env_int("AUTONOMOUS_RECENT_MESSAGES", 20))
         prompt = (
             f"{self.context.memory_blocks_prompt()}\n\n"
-            f"Recent conversation:\n{recent}\n\n"
+            f"Recent conversation (user_id={uid}):\n{recent}\n\n"
             "Please proceed with your task."
         )
 
@@ -586,7 +672,7 @@ class StateMachine:
             print(f"[{state.name}]: {response}")
             if self._response_sink is not None:
                 try:
-                    await self._response_sink(response)
+                    await self._response_sink(uid, response)
                 except Exception as sink_err:
                     print(f"[machine] Response sink error: {sink_err}")
 
@@ -635,7 +721,8 @@ class StateMachine:
                     model_settings={"max_tokens": fitted_max_completion},
                 )
                 all_msgs = result.all_messages()
-                self._histories[state.name] = list(all_msgs)[-max(0, int(max_history)) :]
+                uid = int(self.context.active_user_id or 0)
+                self._histories[(state.name, uid)] = list(all_msgs)[-max(0, int(max_history)) :]
                 return result.output
             except Exception as err:
                 should_retry, bucket = _llm_should_cooldown_and_retry(err)
@@ -695,5 +782,40 @@ class StateMachine:
         return False
 
     @staticmethod
-    async def _read_stdin() -> str:
-        return await asyncio.to_thread(sys.stdin.readline)
+    async def _read_stdin() -> InboundMessage:
+        raw = await asyncio.to_thread(sys.stdin.readline)
+        return InboundMessage(user_id=0, text=raw or "")
+
+    async def _run_human_updates_for_recent_users(self) -> None:
+        """Update per-user HUMAN blocks for every user who messaged in the last hour."""
+        now = int(datetime.now(tz=timezone.utc).timestamp())
+        window_seconds = _env_int("HUMAN_UPDATE_WINDOW_SECONDS", 3600)
+        since_utc = max(0, now - max(60, int(window_seconds)))
+
+        user_ids = self.context.memory_store.list_user_ids_with_recent_messages(since_utc=since_utc)
+        if not user_ids:
+            print("[human_update] No users with recent messages; skipping.")
+            return
+
+        state = self.current
+        for uid in sorted({int(x) for x in user_ids}):
+            self.context.set_active_user(uid)
+            recent = self.context.recent_conversation(
+                user_id=uid,
+                n=_env_int("HUMAN_UPDATE_RECENT_MESSAGES", 40),
+                since_seconds=window_seconds,
+            )
+            prompt = (
+                f"{self.context.memory_blocks_prompt()}\n\n"
+                f"Recent conversation (user_id={uid}, last {window_seconds}s):\n{recent}\n\n"
+                "Please proceed with your task."
+            )
+            response = await self._run_agent_with_rate_limit_retry(
+                state,
+                prompt,
+                message_history=[],
+                max_completion_tokens=_env_int("AUTONOMOUS_MAX_COMPLETION_TOKENS", 2048),
+            )
+            if response is not None:
+                self.context.log_event("assistant", response, state.name)
+                print(f"[{state.name} user_id={uid}]: {response}")

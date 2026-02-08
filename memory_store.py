@@ -30,12 +30,9 @@ class MemoryStore:
 
     def __post_init__(self):
         self.memory_dir.mkdir(parents=True, exist_ok=True)
-        self._ensure_file(self.identity_path, DEFAULT_IDENTITY)
-        self._ensure_file(self.human_path, DEFAULT_HUMAN)
-        self.journal_dir.mkdir(parents=True, exist_ok=True)
         self.sqlite_path.touch(exist_ok=True)
         self._ensure_sqlite_schema()
-        self._migrate_legacy_journal_file()
+        self._migrate_legacy_memory_to_sqlite()
 
     @property
     def identity_path(self) -> Path:
@@ -61,6 +58,56 @@ class MemoryStore:
         """Create tables needed by the app (idempotent)."""
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.sqlite_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_blocks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    block_type TEXT NOT NULL, -- identity|human
+                    user_id INTEGER, -- NULL for global blocks (identity)
+                    content TEXT NOT NULL,
+                    created_at_utc INTEGER NOT NULL,
+                    updated_at_utc INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_blocks_type_user "
+                "ON memory_blocks(block_type, user_id)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS journal_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at_utc INTEGER NOT NULL,
+                    content TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_journal_entries_created "
+                "ON journal_entries(created_at_utc)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    chat_id INTEGER,
+                    role TEXT NOT NULL, -- user|assistant
+                    state TEXT,
+                    content TEXT NOT NULL,
+                    created_at_utc INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_messages_user_time "
+                "ON chat_messages(user_id, created_at_utc)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_messages_time "
+                "ON chat_messages(created_at_utc)"
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS scheduled_self_messages (
@@ -398,62 +445,58 @@ class MemoryStore:
             conn.commit()
 
     def load_identity(self) -> str:
-        return self._load_or_default(self.identity_path, DEFAULT_IDENTITY)
+        row = self._get_memory_block(block_type="identity", user_id=None)
+        return row if row else DEFAULT_IDENTITY.strip()
 
-    def load_human(self) -> str:
-        return self._load_or_default(self.human_path, DEFAULT_HUMAN)
+    def load_human(self, *, user_id: int) -> str:
+        uid = int(user_id or 0)
+        row = self._get_memory_block(block_type="human", user_id=uid)
+        if row:
+            return row
+        # Keep the legacy structure but annotate user_id for clarity.
+        return (
+            f"Name: Unknown (Telegram user_id: {uid})\n"
+            "Likes: Unknown\n"
+            "Dislikes: Unknown\n"
+            "Bio: No details recorded yet.\n"
+        ).strip()
 
     def save_identity(self, content: str):
-        self._save(self.identity_path, content)
+        text = (content or "").strip()
+        if not text:
+            return
+        self._set_memory_block(block_type="identity", user_id=None, content=text)
 
-    def save_human(self, content: str):
-        self._save(self.human_path, content)
+    def save_human(self, *, user_id: int, content: str):
+        text = (content or "").strip()
+        if not text:
+            return
+        self._set_memory_block(block_type="human", user_id=int(user_id or 0), content=text)
 
     def load_journal_entries(self) -> list[str]:
-        entries: list[str] = []
-        for path in sorted(self.journal_dir.glob("*.txt")):
-            text = path.read_text(encoding="utf-8").strip()
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT content FROM journal_entries ORDER BY created_at_utc ASC, id ASC"
+            ).fetchall()
+        out: list[str] = []
+        for r in rows:
+            text = str(r["content"]).strip()
             if text:
-                entries.append(text)
-        return entries
+                out.append(text)
+        return out
 
     def append_journal_entry(self, content: str):
         text = content.strip()
         if not text:
             return
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        path = self.journal_dir / f"{stamp}.txt"
-        suffix = 1
-        while path.exists():
-            path = self.journal_dir / f"{stamp}-{suffix}.txt"
-            suffix += 1
-        path.write_text(f"{text}\n", encoding="utf-8")
-
-    def _migrate_legacy_journal_file(self):
-        if not self.legacy_journal_path.exists():
-            return
-
-        if any(self.journal_dir.glob("*.txt")):
-            self.legacy_journal_path.unlink(missing_ok=True)
-            return
-
-        text = self.legacy_journal_path.read_text(encoding="utf-8").strip()
-        if text.startswith(JOURNAL_HEADER):
-            text = text[len(JOURNAL_HEADER) :].strip()
-
-        if text:
-            chunks = [c.strip() for c in text.split("\n\n") if c.strip()]
-            for chunk in chunks:
-                self.append_journal_entry(chunk)
-
-        self.legacy_journal_path.unlink(missing_ok=True)
-
-    @staticmethod
-    def _save(path: Path, content: str):
-        text = content.strip()
-        if not text:
-            return
-        path.write_text(f"{text}\n", encoding="utf-8")
+        now = self._now_utc_epoch()
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.execute(
+                "INSERT INTO journal_entries(created_at_utc, content) VALUES (?, ?)",
+                (now, text),
+            )
+            conn.commit()
 
     @staticmethod
     def _ensure_file(path: Path, default_text: str):
@@ -464,3 +507,181 @@ class MemoryStore:
     def _load_or_default(path: Path, default_text: str) -> str:
         text = path.read_text(encoding="utf-8").strip()
         return text if text else default_text.strip()
+
+    def append_chat_message(
+        self,
+        *,
+        user_id: int,
+        role: str,
+        content: str,
+        state: str | None = None,
+        chat_id: int | None = None,
+    ) -> None:
+        text = (content or "").strip()
+        if not text:
+            return
+        safe_role = (role or "").strip().lower()
+        if safe_role not in ("user", "assistant"):
+            raise ValueError("role must be 'user' or 'assistant'.")
+        now = self._now_utc_epoch()
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.execute(
+                "INSERT INTO chat_messages(user_id, chat_id, role, state, content, created_at_utc) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (int(user_id or 0), int(chat_id) if chat_id is not None else None, safe_role, (state or "").strip() or None, text, now),
+            )
+            conn.commit()
+
+    def load_recent_chat_messages(
+        self,
+        *,
+        user_id: int,
+        limit: int = 20,
+        since_utc: int | None = None,
+    ) -> list[dict[str, object]]:
+        safe_limit = max(1, min(int(limit), 200))
+        uid = int(user_id or 0)
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.row_factory = sqlite3.Row
+            if since_utc is None:
+                rows = conn.execute(
+                    "SELECT role, content, created_at_utc FROM chat_messages "
+                    "WHERE user_id = ? "
+                    "ORDER BY created_at_utc DESC, id DESC "
+                    "LIMIT ?",
+                    (uid, safe_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT role, content, created_at_utc FROM chat_messages "
+                    "WHERE user_id = ? AND created_at_utc >= ? "
+                    "ORDER BY created_at_utc DESC, id DESC "
+                    "LIMIT ?",
+                    (uid, int(since_utc), safe_limit),
+                ).fetchall()
+        out = [dict(r) for r in reversed(rows)]
+        return out
+
+    def list_user_ids_with_recent_messages(self, *, since_utc: int) -> list[int]:
+        cutoff = int(since_utc)
+        with sqlite3.connect(self.sqlite_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT user_id FROM chat_messages "
+                "WHERE role = 'user' AND created_at_utc >= ?",
+                (cutoff,),
+            ).fetchall()
+        return [int(r[0]) for r in rows if r and r[0] is not None]
+
+    def _get_memory_block(self, *, block_type: str, user_id: int | None) -> str | None:
+        bt = (block_type or "").strip().lower()
+        if bt not in ("identity", "human"):
+            raise ValueError("block_type must be 'identity' or 'human'.")
+        with sqlite3.connect(self.sqlite_path) as conn:
+            row = conn.execute(
+                "SELECT content FROM memory_blocks WHERE block_type = ? AND user_id IS ?",
+                (bt, user_id),
+            ).fetchone()
+        if not row:
+            return None
+        text = str(row[0]).strip()
+        return text or None
+
+    def _set_memory_block(self, *, block_type: str, user_id: int | None, content: str) -> None:
+        bt = (block_type or "").strip().lower()
+        if bt not in ("identity", "human"):
+            raise ValueError("block_type must be 'identity' or 'human'.")
+        text = (content or "").strip()
+        if not text:
+            return
+        now = self._now_utc_epoch()
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_blocks(block_type, user_id, content, created_at_utc, updated_at_utc)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(block_type, user_id)
+                DO UPDATE SET content = excluded.content, updated_at_utc = excluded.updated_at_utc
+                """,
+                (bt, user_id, text, now, now),
+            )
+            conn.commit()
+
+    def _migrate_legacy_memory_to_sqlite(self) -> None:
+        """One-way migrate identity/human/journal text files into SQLite when SQLite is empty."""
+        # Ensure legacy dirs exist for reading if present; do not create/write new legacy files.
+        self.journal_dir.mkdir(parents=True, exist_ok=True)
+
+        # Identity
+        if not self._get_memory_block(block_type="identity", user_id=None):
+            legacy_identity: str | None = None
+            if self.identity_path.exists():
+                legacy_identity = self.identity_path.read_text(encoding="utf-8").strip()
+            self._set_memory_block(
+                block_type="identity",
+                user_id=None,
+                content=(legacy_identity or DEFAULT_IDENTITY).strip(),
+            )
+
+        # Human: legacy was a single shared file; migrate into main user if known, else user_id=0.
+        with sqlite3.connect(self.sqlite_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM memory_blocks WHERE block_type='human' LIMIT 1"
+            ).fetchone()
+        if not row:
+            main_uid = 0
+            raw = os.environ.get("TELEGRAM_USER_ID", "").strip()
+            try:
+                main_uid = int(raw) if raw else 0
+            except Exception:
+                main_uid = 0
+            legacy_human: str | None = None
+            if self.human_path.exists():
+                legacy_human = self.human_path.read_text(encoding="utf-8").strip()
+            self._set_memory_block(
+                block_type="human",
+                user_id=int(main_uid),
+                content=(legacy_human or DEFAULT_HUMAN).strip(),
+            )
+
+        # Journal: migrate legacy journal.txt (if any) plus journal/*.txt, but only if SQLite has none.
+        with sqlite3.connect(self.sqlite_path) as conn:
+            has_any = conn.execute("SELECT 1 FROM journal_entries LIMIT 1").fetchone()
+        if has_any:
+            return
+
+        to_insert: list[tuple[int, str]] = []
+
+        if self.legacy_journal_path.exists():
+            text = self.legacy_journal_path.read_text(encoding="utf-8").strip()
+            if text.startswith(JOURNAL_HEADER):
+                text = text[len(JOURNAL_HEADER) :].strip()
+            if text:
+                chunks = [c.strip() for c in text.split("\n\n") if c.strip()]
+                for chunk in chunks:
+                    to_insert.append((self._now_utc_epoch(), chunk))
+
+        # Migrate per-entry files.
+        for path in sorted(self.journal_dir.glob("*.txt")):
+            txt = path.read_text(encoding="utf-8").strip()
+            if not txt:
+                continue
+            created_at = int(path.stat().st_mtime)
+            # Try to parse filenames like 20260208-010814-322814.txt
+            name = path.stem
+            try:
+                # YYYYMMDD-HHMMSS-ffffff
+                dt = datetime.strptime(name.split("-")[0] + name.split("-")[1], "%Y%m%d%H%M%S")
+                created_at = int(dt.timestamp())
+            except Exception:
+                pass
+            to_insert.append((created_at, txt))
+
+        if not to_insert:
+            return
+
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.executemany(
+                "INSERT INTO journal_entries(created_at_utc, content) VALUES (?, ?)",
+                to_insert,
+            )
+            conn.commit()
